@@ -2,17 +2,19 @@ use serde_json;
 use crate::mindmap::MindMapService;
 use crate::tools::{Tool, ToolContext};
 
-pub struct BuildMindMapTool;
+pub struct MindMapTool;
 
 #[async_trait::async_trait]
-impl Tool for BuildMindMapTool {
+impl Tool for MindMapTool {
     fn name(&self) -> &str {
-        "build_mindmap"
+        "mindmap"
     }
 
     fn description(&self) -> &str {
         "Scans the allowed file system paths and builds a graph of files and their relationships (imports, references, directory structure). Returns the mind map as JSON with nodes and edges."
     }
+
+    fn is_core(&self) -> bool { false }
 
     async fn execute(&self, _input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let mut mm = MindMapService::new();

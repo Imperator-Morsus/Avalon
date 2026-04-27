@@ -16,6 +16,8 @@ impl Tool for ReadFileTool {
         "Reads the contents of a file at the given path."
     }
 
+    fn is_core(&self) -> bool { true }
+
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
         let result = ctx.fs.read_file(path);
@@ -32,6 +34,8 @@ impl Tool for WriteFileTool {
     fn description(&self) -> &str {
         "Writes or overwrites a file at the given path with the provided content."
     }
+
+    fn is_core(&self) -> bool { true }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
@@ -51,6 +55,8 @@ impl Tool for ListDirTool {
         "Lists all files and directories in the given path."
     }
 
+    fn is_core(&self) -> bool { true }
+
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
         let result = ctx.fs.list_dir(path);
@@ -67,6 +73,8 @@ impl Tool for DeleteFileTool {
     fn description(&self) -> &str {
         "Deletes a file or directory at the given path."
     }
+
+    fn is_core(&self) -> bool { true }
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;

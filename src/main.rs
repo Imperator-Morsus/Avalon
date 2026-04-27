@@ -731,7 +731,8 @@ async fn list_tools(registry: web::Data<Mutex<tools::ToolRegistry>>, config: web
         json!({
             "name": t.name,
             "description": t.description,
-            "active": is_active
+            "active": is_active,
+            "is_core": t.is_core
         })
     }).collect();
     HttpResponse::Ok().json(json!({ "tools": tools }))
@@ -940,7 +941,8 @@ async fn chat_handler(
         let active_set: HashSet<String> = cfg.active_tools.iter().cloned().collect();
         let mut tool_results: Vec<serde_json::Value> = Vec::new();
         for call in &calls {
-            if !active_set.contains(&call.name) {
+            let is_core = registry.get(&call.name).map(|t| t.is_core()).unwrap_or(false);
+            if !active_set.contains(&call.name) && !is_core {
                 let e = format!("Tool '{}' is deactivated. Activate it in Settings > Plugins to use it.", call.name);
                 debug_log.lock().unwrap().push("tool_error", json!({
                     "tool": call.name,
@@ -1310,17 +1312,29 @@ async fn main() -> std::io::Result<()> {
     registry.register(Box::new(tools::fs_tools::ListDirTool));
     registry.register(Box::new(tools::fs_tools::DeleteFileTool));
     registry.register(Box::new(tools::config_tool::GetFsConfigTool));
-    registry.register(Box::new(tools::mindmap_tool::BuildMindMapTool));
+    registry.register(Box::new(tools::mindmap_tool::MindMapTool));
 
     let all_tool_names: Vec<String> = registry.names().iter().map(|s| s.to_string()).collect();
     let mut config = AppConfig::new();
+    // Migrate old tool names
+    config.active_tools = config.active_tools.iter().map(|name| {
+        if name == "build_mindmap" { "mindmap".to_string() } else { name.clone() }
+    }).collect();
+    // Ensure core tools are always active
+    let core_names: Vec<String> = registry.list().iter().filter(|t| t.is_core).map(|t| t.name.clone()).collect();
+    let active_set: std::collections::HashSet<String> = config.active_tools.iter().cloned().collect();
+    for core_name in core_names {
+        if !active_set.contains(&core_name) {
+            config.active_tools.push(core_name);
+        }
+    }
     if config.active_tools.is_empty() {
         config.active_tools = all_tool_names.clone();
     }
     let active_tools_set: std::collections::HashSet<String> = config.active_tools.iter().cloned().collect();
     let active_tools_list: Vec<&str> = all_tool_names.iter().filter(|name| active_tools_set.contains(*name)).map(|s| s.as_str()).collect();
     let tools_list = active_tools_list.join(", ");
-    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use build_mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
+    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
 
     let model_service: Box<dyn ModelInferenceService> = match HttpModelService::new() {
         Ok(mut svc) => {

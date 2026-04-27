@@ -15,12 +15,14 @@ pub struct ToolContext<'a> {
 pub struct ToolInfo {
     pub name: String,
     pub description: String,
+    pub is_core: bool,
 }
 
 #[async_trait::async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
+    fn is_core(&self) -> bool { true }
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String>;
 }
 
@@ -49,6 +51,7 @@ impl ToolRegistry {
             .map(|t| ToolInfo {
                 name: t.name().to_string(),
                 description: t.description().to_string(),
+                is_core: t.is_core(),
             })
             .collect()
     }

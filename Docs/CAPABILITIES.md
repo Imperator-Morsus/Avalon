@@ -47,7 +47,7 @@ Tools are now **plugins**. They implement the `Tool` trait, register in a `ToolR
 | `list_dir` | Lists files and directories | `{ path: string }` |
 | `delete_file` | Deletes a file or directory | `{ path: string }` |
 | `get_fs_config` | Reads the file system limiter config | `{}` |
-| `build_mindmap` | Scans allowed paths and builds a graph of files and their relationships | `{}` |
+| `mindmap` | Scans allowed paths and builds a graph of files and their relationships | `{}` |
 
 Tool calls are embedded in AI responses as XML:
 ```xml
@@ -192,7 +192,7 @@ Avalon will:
 
 You can also trigger it manually:
 - **Frontend**: Click the "Mindmap" button in the debug panel
-- **AI tool**: Ask the AI to `<tool><name>build_mindmap</name><input>{}</input></tool>`
+- **AI tool**: Ask the AI to `<tool><name>mindmap</name><input>{}</input></tool>`
 - **API**: `GET /api/mindmap` returns the raw graph JSON
 
 ### Graph Format

@@ -691,10 +691,11 @@ async function revokePermission(tool) {
 }
 
 function renderPluginsHtml() {
-  if (!window._plugins || window._plugins.length === 0) {
+  const optional = (window._plugins || []).filter(t => !t.is_core);
+  if (optional.length === 0) {
     return '';
   }
-  const rows = window._plugins.map(t => `
+  const rows = optional.map(t => `
     <div class="plugin-row">
       <label class="plugin-checkbox-label">
         <input type="checkbox" data-plugin="${t.name}" ${t.active ? 'checked' : ''} onchange="togglePlugin('${t.name}')" />
@@ -729,7 +730,7 @@ function togglePlugin(name) {
 }
 
 async function savePlugins() {
-  const activeTools = window._plugins.filter(t => t.active).map(t => t.name);
+  const activeTools = window._plugins.filter(t => t.is_core || t.active).map(t => t.name);
   try {
     const res = await fetch(`${API_BASE}/api/plugins`, {
       method: 'POST',

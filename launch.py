@@ -424,7 +424,7 @@ def main():
                 pass
 
         log("Goodbye.")
-        input("Press Enter to close this window...")
+        input("Press Enter to access prompt...")
 
 
 if __name__ == "__main__":

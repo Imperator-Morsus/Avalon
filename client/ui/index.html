@@ -1,0 +1,73 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Avalon</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header>
+  <div>
+    <h1>Avalon</h1>
+    <div class="subtitle">Your AI working harness</div>
+  </div>
+  <div class="model-select">
+    <label for="model">Model</label>
+    <select id="model"></select>
+    <button class="preload-btn" id="preloadBtn">Preload</button>
+    <button class="settings-btn" id="settingsBtn" title="Settings">&#x2699;</button>
+  </div>
+</header>
+
+<div class="main">
+  <div class="chat-area">
+    <div class="chat-history" id="chatHistory"></div>
+
+    <div class="permission-panel" id="permPanel">
+      <h3>Permission Required</h3>
+      <div class="permission-info" id="permInfo"></div>
+      <div class="permission-actions">
+        <button class="perm-btn approve" id="permApprove">Approve</button>
+        <button class="perm-btn deny" id="permDeny">Deny</button>
+      </div>
+    </div>
+
+    <div class="input-bar">
+      <textarea id="userInput" rows="1" placeholder="Ask anything..." autofocus></textarea>
+      <button class="send-btn" id="sendBtn">Send</button>
+    </div>
+  </div>
+
+  <div class="settings-panel hidden" id="settingsPanel">
+    <div class="settings-header">
+      <span>Settings</span>
+      <button class="settings-close" id="settingsCloseBtn">&#x2715;</button>
+    </div>
+    <div class="settings-body" id="settingsBody"></div>
+  </div>
+
+  <!-- Debug panel -->
+  <div class="debug-panel collapsed" id="debugPanel">
+    <div class="debug-toggle" id="debugToggle">
+      <span class="debug-toggle-icon">&#9654;</span>
+      <span class="debug-label">Debug</span>
+      <div class="debug-header-actions">
+        <button class="debug-btn" id="debugMindMapBtn">Mindmap</button>
+        <button class="debug-btn" id="debugSaveBtn">Save</button>
+        <button class="debug-btn" id="debugClearBtn">Clear</button>
+      </div>
+    </div>
+    <div class="debug-content" id="debugContent"></div>
+  </div>
+</div>
+
+<div class="status-bar" id="statusBar">
+  <span><span class="dot" id="statusDot"></span><span id="statusText">Loading models...</span></span>
+  <span id="iterCount"></span>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>

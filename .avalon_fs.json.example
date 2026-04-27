@@ -1,0 +1,14 @@
+{
+  "default_policy": "deny",
+  "allowed_paths": [
+    "D:/Avalon/src",
+    "D:/Avalon/client",
+    "D:/Avalon/docs"
+  ],
+  "denied_paths": [
+    "D:/Avalon/.env",
+    "D:/Avalon/.avalon_state.json",
+    "D:/Avalon/secrets"
+  ],
+  "max_file_size": 10485760
+}

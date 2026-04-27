@@ -1,0 +1,13 @@
+{
+  "name": "avalon-client",
+  "version": "0.2.0",
+  "description": "Avalon AI Harness — Electron Frontend",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev"
+  },
+  "devDependencies": {
+    "electron": "^30.0.0"
+  }
+}

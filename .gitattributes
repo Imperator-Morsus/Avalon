@@ -1,0 +1,22 @@
+# Auto-detect text files and normalize line endings to LF on commit
+* text=auto
+
+# Explicitly treat these as text files (always LF in repo)
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.sh text eol=lf
+*.py text eol=lf
+
+# Binary files (do not modify line endings)
+*.exe binary
+*.dll binary
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff binary
+*.woff2 binary

@@ -1,2 +1,2 @@
 # Avalon
-Humnazied AI Harness
+Humanized AI Harness

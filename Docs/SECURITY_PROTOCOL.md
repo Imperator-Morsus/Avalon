@@ -116,15 +116,67 @@ Stored in `.avalon_state.json` under `web_fetch`:
 
 ## 7. Audit & Logging
 
-Every significant event is logged to the debug log:
-- Session start/end
-- LLM requests and responses
-- Tool calls, results, and errors
-- Permission requests, approvals, denials, revocations
-- Mind map builds
-- File system operations
+Avalon maintains a **cryptographically verifiable audit trail** for every session. The audit log is append-only, hash-chained, and tamper-evident by design.
 
-Logs can be saved to `logs/avalon-debug-{timestamp}.md` for external review.
+### 7.1 Hash Chain Integrity
+
+Each audit entry contains:
+- `seq` — monotonic sequence number
+- `prev_hash` — SHA-256 of the previous entry
+- `entry_hash` — SHA-256 of (`prev_hash` + `seq` + `session_id` + `timestamp_ms` + `entry_type` + `actor` + serialized `data`)
+
+Changing any entry breaks all subsequent hashes. Verification re-computes every hash and confirms the chain.
+
+### 7.2 Entry Types
+
+| Type | Actor | Description |
+|------|-------|-------------|
+| `user_message` | user | User sent a chat message |
+| `api_response` | assistant | Model returned a response |
+| `reasoning` | assistant | Model emitted reasoning/thinking |
+| `tool_call` | assistant | AI requested a tool execution |
+| `tool_error` | assistant | Tool execution failed |
+| `permission_decision` | user | User approved a permission request |
+| `permission_denied` | user | User denied a permission request |
+| `permission_revoked` | user | User revoked a session permission |
+| `mindmap_build` | system | Automatic mindmap generation |
+| `error` | system | Backend or connection error |
+
+### 7.3 Storage Tiers
+
+| Tier | Path | Retention | Format |
+|------|------|-----------|--------|
+| **Hot** | `logs/audit/active/{session_id}.ndjson` | Current session | Append-only NDJSON |
+| **Warm** | `logs/audit/YYYY-MM-DD.tar.gz` | 0–30 days | Gzipped tar of sessions + manifest |
+| **Cold** | `archive/YYYY/MM/avalon-audit-YYYY-MM.tar.gz` | 30 days–7 years | Compressed archive with signed manifest |
+
+### 7.4 Session Manifest
+
+When a session ends, a manifest is written:
+- `start_time`, `end_time`, `entry_count`
+- `merkle_root` — recursive pairwise hash of all entry hashes
+- `closing_hash` — final entry hash
+
+### 7.5 Verification & Export
+
+**Verify a session:**
+```bash
+curl http://127.0.0.1:8080/api/audit/verify/{session_id}
+```
+
+**Export chain-of-custody report (Markdown):**
+```bash
+curl http://127.0.0.1:8080/api/audit/export/{session_id}
+```
+
+The export includes:
+1. Full entry list with hashes
+2. Step-by-step verification instructions
+3. Manifest status
+
+### 7.6 WORM Behavior
+
+On Unix systems, closed session files are set to read-only (`0o444`). The append-only NDJSON design ensures that even without filesystem-level immutability, any tampering is detectable via hash verification.
 
 ---
 

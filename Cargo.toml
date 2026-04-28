@@ -16,3 +16,8 @@ regex = "1"
 zip = "2"
 base64 = "0.22"
 lopdf = "0.34"
+sha2 = "0.10"
+hex = "0.4"
+flate2 = "1"
+tar = "0.4"
+chrono = { version = "0.4", features = ["serde"] }

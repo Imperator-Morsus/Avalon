@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use base64::{Engine as _, engine::general_purpose};
 
 // ═════════════════════════════════════════════════════════════════════════════
 // File System Configuration (Limiter)
@@ -164,6 +165,16 @@ pub struct FileOperationResult {
     pub entries: Option<Vec<String>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ImageReadResult {
+    pub success: bool,
+    pub path: String,
+    pub base64: Option<String>,
+    pub mime_type: Option<String>,
+    pub warnings: Vec<String>,
+    pub error: Option<String>,
+}
+
 impl FileSystemService {
     pub fn new() -> Self {
         FileSystemService {
@@ -243,6 +254,168 @@ impl FileSystemService {
                 error: Some(format!("Failed to read file: {}", e)),
                 entries: None,
             },
+        }
+    }
+
+    /// Read an image file and scan for hidden data / steganography.
+    /// Returns base64-encoded image, with warnings about any anomalies found.
+    pub fn read_image(&self, path: &str) -> ImageReadResult {
+        if let Err(e) = self.check_limiter(path) {
+            return ImageReadResult {
+                success: false,
+                path: path.to_string(),
+                base64: None,
+                mime_type: None,
+                warnings: vec![e],
+                error: None,
+            };
+        }
+
+        let meta = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(e) => return ImageReadResult {
+                success: false,
+                path: path.to_string(),
+                base64: None,
+                mime_type: None,
+                warnings: Vec::new(),
+                error: Some(format!("Failed to read metadata: {}", e)),
+            },
+        };
+
+        if meta.len() > self.config.max_file_size as u64 {
+            return ImageReadResult {
+                success: false,
+                path: path.to_string(),
+                base64: None,
+                mime_type: None,
+                warnings: Vec::new(),
+                error: Some(format!(
+                    "File too large: {} MB (max {} MB)",
+                    meta.len() / (1024 * 1024),
+                    self.config.max_file_size / (1024 * 1024)
+                )),
+            };
+        }
+
+        let bytes = match std::fs::read(path) {
+            Ok(b) => b,
+            Err(e) => return ImageReadResult {
+                success: false,
+                path: path.to_string(),
+                base64: None,
+                mime_type: None,
+                warnings: Vec::new(),
+                error: Some(format!("Failed to read file: {}", e)),
+            },
+        };
+
+        let ext = Path::new(path)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let mime = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "bmp" => "image/bmp",
+            "svg" => "image/svg+xml",
+            "ico" => "image/x-icon",
+            _ => "application/octet-stream",
+        };
+
+        let (cleaned, mut warnings) = Self::scan_and_strip_hidden_data(&bytes, &ext);
+
+        if cleaned.len() < bytes.len() {
+            let hidden = bytes.len() - cleaned.len();
+            warnings.push(format!(
+                "Stripped {} bytes of hidden data appended after image EOF marker.",
+                hidden
+            ));
+        }
+
+        let b64 = general_purpose::STANDARD.encode(&cleaned);
+
+        ImageReadResult {
+            success: true,
+            path: path.to_string(),
+            base64: Some(b64),
+            mime_type: Some(mime.to_string()),
+            warnings,
+            error: None,
+        }
+    }
+
+    /// Scan image bytes for hidden data and return cleaned image.
+    /// Detects: extra bytes after EOF markers, suspicious large trailing data.
+    fn scan_and_strip_hidden_data(bytes: &[u8], ext: &str) -> (Vec<u8>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let mut eof_pos: Option<usize> = None;
+
+        match ext {
+            "png" => {
+                // PNG: scan for IEND chunk (49 45 4E 44 AE 42 60 82)
+                let iend = [0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82];
+                for i in 0..=bytes.len().saturating_sub(8) {
+                    if &bytes[i..i+8] == &iend[..] {
+                        eof_pos = Some(i + 8);
+                        break;
+                    }
+                }
+            }
+            "jpg" | "jpeg" => {
+                // JPEG: EOI marker FF D9
+                for i in 0..=bytes.len().saturating_sub(2) {
+                    if bytes[i] == 0xFF && bytes[i+1] == 0xD9 {
+                        eof_pos = Some(i + 2);
+                    }
+                }
+            }
+            "gif" => {
+                // GIF: trailer byte 3B
+                if let Some(pos) = bytes.iter().rposition(|b| *b == 0x3B) {
+                    eof_pos = Some(pos + 1);
+                }
+            }
+            "webp" => {
+                // WebP: RIFF container, file size at offset 4
+                if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" {
+                    let size = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+                    eof_pos = Some(8 + size as usize);
+                }
+            }
+            "bmp" => {
+                // BMP: file size at offset 2
+                if bytes.len() >= 6 {
+                    let size = u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]);
+                    eof_pos = Some(size as usize);
+                }
+            }
+            "svg" => {
+                // SVG: check for embedded base64 images or scripts after closing </svg>
+                if let Some(pos) = bytes.windows(6).position(|w| w == b"</svg>") {
+                    eof_pos = Some(pos + 6);
+                }
+            }
+            _ => {}
+        }
+
+        // Heuristic: if trailing data is > 1KB after expected EOF, flag it
+        if let Some(pos) = eof_pos {
+            if pos < bytes.len() && bytes.len() - pos > 1024 {
+                warnings.push(format!(
+                    "Suspicious: {} bytes of data after expected EOF (possible steganography).",
+                    bytes.len() - pos
+                ));
+            }
+            (bytes[..pos].to_vec(), warnings)
+        } else {
+            // No EOF marker found — could be malformed or a different format
+            warnings.push("Could not locate expected EOF marker; image may be malformed or contain hidden data.".to_string());
+            (bytes.to_vec(), warnings)
         }
     }
 

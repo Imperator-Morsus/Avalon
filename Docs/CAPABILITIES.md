@@ -267,11 +267,57 @@ Tools can be activated or deactivated per-session:
 | GET | `/api/mindmap` | Get the codebase graph |
 | GET/POST | `/api/fs/config` | Get/set file system limiter config |
 | GET/POST | `/api/web/config` | Get/set web fetch config |
+| POST | `/api/fetch` | Direct fetch URL (bypasses AI tool gatekeeping) |
 | POST | `/api/fs/read` | Read a file |
 | POST | `/api/fs/write` | Write a file |
 | POST | `/api/fs/list` | List a directory |
 | POST | `/api/fs/delete` | Delete a file/directory |
 | POST | `/v1/infer` | Legacy inference endpoint |
+
+### Direct Fetch (`/api/fetch`)
+
+Bypasses the AI tool-calling gatekeeping and runs the same safe fetch pipeline directly. Returns sanitized content for user review before it is sent to the model.
+
+**Request:**
+```json
+POST /api/fetch
+{ "url": "https://example.com/document.pdf" }
+```
+
+**Response (text):**
+```json
+{
+  "url": "https://example.com/document.pdf",
+  "type": "text",
+  "mime_type": "text/html",
+  "size": 528,
+  "content": "..."
+}
+```
+
+**Response (image):**
+```json
+{
+  "url": "https://example.com/image.png",
+  "type": "image",
+  "mime_type": "image/png",
+  "size": 5969,
+  "base64": "iVBORw0KGgo..."
+}
+```
+
+**Response (PDF):**
+```json
+{
+  "url": "https://example.com/document.pdf",
+  "type": "pdf",
+  "mime_type": "application/pdf",
+  "size": 13248,
+  "content": "Extracted plain text..."
+}
+```
+
+Security is identical to the `fetch_url` tool — all URL validation, SSRF blocking, content sanitization, size limits, and domain checks are enforced in the Rust backend.
 
 ---
 

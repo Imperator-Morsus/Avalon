@@ -67,22 +67,265 @@ document.getElementById('debugSaveBtn').addEventListener('click', async (e) => {
   } catch(err) {}
 });
 
+const mindmapOverlay = document.getElementById('mindmapOverlay');
+const mindmapSvg = document.getElementById('mindmapSvg');
+const mindmapContainer = document.getElementById('mindmapContainer');
+
+async function renderMindmap(data) {
+  const ns = 'http://www.w3.org/2000/svg';
+  const svg = mindmapSvg;
+  svg.innerHTML = '';
+
+  const width = mindmapContainer.clientWidth;
+  const height = mindmapContainer.clientHeight;
+  svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
+
+  const nodes = data.nodes.map(n => ({ ...n, x: width / 2 + (Math.random() - 0.5) * 200, y: height / 2 + (Math.random() - 0.5) * 200 }));
+  const nodeMap = new Map(nodes.map(n => [n.id, n]));
+  const edges = data.edges.map(e => ({ ...e, source: nodeMap.get(e.source), target: nodeMap.get(e.target) })).filter(e => e.source && e.target);
+
+  // Pre-fetch images
+  const imageNodes = nodes.filter(n => n.node_type === 'image');
+  const imagePromises = imageNodes.map(async n => {
+    const imgPath = n.metadata?.image_path || n.id;
+    try {
+      const res = await fetch(`${API_BASE}/api/fs/image`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path: imgPath })
+      });
+      const imgData = await res.json();
+      if (imgData.success && imgData.base64) {
+        if (imgData.warnings && imgData.warnings.length > 0) {
+          addDebugLine(`[${ts()}] IMAGE WARNING ${n.label}: ${imgData.warnings.join(', ')}`, 'error');
+        }
+        return { id: n.id, base64: imgData.base64, mime: imgData.mime_type };
+      }
+    } catch(e) {}
+    return { id: n.id, base64: null, mime: null };
+  });
+  const imageResults = await Promise.all(imagePromises);
+  const imageMap = new Map(imageResults.map(r => [r.id, r]));
+
+  // Force-directed simulation (lightweight)
+  const k = Math.sqrt((width * height) / nodes.length) * 0.8;
+  const iterations = 300;
+
+  for (let i = 0; i < iterations; i++) {
+    // Repulsion
+    for (let a = 0; a < nodes.length; a++) {
+      for (let b = a + 1; b < nodes.length; b++) {
+        const na = nodes[a], nb = nodes[b];
+        let dx = na.x - nb.x, dy = na.y - nb.y;
+        let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+        const force = (k * k) / dist;
+        const fx = (dx / dist) * force * 0.05;
+        const fy = (dy / dist) * force * 0.05;
+        na.x += fx; na.y += fy;
+        nb.x -= fx; nb.y -= fy;
+      }
+    }
+    // Attraction
+    for (const e of edges) {
+      let dx = e.target.x - e.source.x, dy = e.target.y - e.source.y;
+      let dist = Math.sqrt(dx * dx + dy * dy) || 1;
+      const force = (dist * dist) / k * 0.02;
+      const fx = (dx / dist) * force;
+      const fy = (dy / dist) * force;
+      e.source.x += fx; e.source.y += fy;
+      e.target.x -= fx; e.target.y -= fy;
+    }
+    // Center gravity
+    for (const n of nodes) {
+      n.x += (width / 2 - n.x) * 0.01;
+      n.y += (height / 2 - n.y) * 0.01;
+    }
+  }
+
+  // Find bounds and scale to fit
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const n of nodes) {
+    minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
+    maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
+  }
+  const pad = 60;
+  const graphW = maxX - minX + pad * 2;
+  const graphH = maxY - minY + pad * 2;
+  const scale = Math.min(width / graphW, height / graphH, 1.2);
+  const offsetX = (width - (maxX - minX) * scale) / 2 - minX * scale;
+  const offsetY = (height - (maxY - minY) * scale) / 2 - minY * scale;
+
+  const g = document.createElementNS(ns, 'g');
+  g.setAttribute('transform', `translate(${offsetX},${offsetY}) scale(${scale})`);
+
+  // Edges
+  for (const e of edges) {
+    const line = document.createElementNS(ns, 'line');
+    line.setAttribute('x1', e.source.x);
+    line.setAttribute('y1', e.source.y);
+    line.setAttribute('x2', e.target.x);
+    line.setAttribute('y2', e.target.y);
+    line.setAttribute('class', 'mindmap-edge');
+    g.appendChild(line);
+  }
+
+  // Nodes
+  const rootId = data.root;
+  for (const n of nodes) {
+    const nodeG = document.createElementNS(ns, 'g');
+    nodeG.setAttribute('class', 'mindmap-node');
+    nodeG.setAttribute('transform', `translate(${n.x},${n.y})`);
+
+    const isRoot = n.id === rootId;
+    const isDir = n.node_type === 'dir';
+    const isImage = n.node_type === 'image';
+    const r = isRoot ? 14 : isDir ? 10 : 6;
+
+    if (isImage) {
+      const imgInfo = imageMap.get(n.id);
+      if (imgInfo && imgInfo.base64) {
+        const imgSize = 24;
+        const imageEl = document.createElementNS(ns, 'image');
+        imageEl.setAttribute('x', -imgSize / 2);
+        imageEl.setAttribute('y', -imgSize / 2);
+        imageEl.setAttribute('width', imgSize);
+        imageEl.setAttribute('height', imgSize);
+        imageEl.setAttribute('href', `data:${imgInfo.mime};base64,${imgInfo.base64}`);
+        imageEl.setAttribute('preserveAspectRatio', 'xMidYMid slice');
+        imageEl.style.clipPath = 'circle(50%)';
+        nodeG.appendChild(imageEl);
+      } else {
+        // Fallback: image placeholder circle
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('r', r);
+        circle.setAttribute('fill', '#c084fc');
+        nodeG.appendChild(circle);
+      }
+    } else if (isDir || isRoot) {
+      const rect = document.createElementNS(ns, 'rect');
+      rect.setAttribute('x', -r * 1.6);
+      rect.setAttribute('y', -r);
+      rect.setAttribute('width', r * 3.2);
+      rect.setAttribute('height', r * 2);
+      rect.setAttribute('rx', r);
+      rect.setAttribute('fill', isRoot ? '#e67e22' : '#5a8dee');
+      nodeG.appendChild(rect);
+    } else {
+      const circle = document.createElementNS(ns, 'circle');
+      circle.setAttribute('r', r);
+      circle.setAttribute('fill', '#8fd460');
+      nodeG.appendChild(circle);
+    }
+
+    const text = document.createElementNS(ns, 'text');
+    text.setAttribute('text-anchor', 'middle');
+    text.setAttribute('dy', isDir || isRoot ? '0.35em' : '-0.8em');
+    text.textContent = n.label;
+    nodeG.appendChild(text);
+
+    g.appendChild(nodeG);
+  }
+
+  svg.appendChild(g);
+}
+
+let mindmapData = null;
+
 document.getElementById('debugMindMapBtn').addEventListener('click', async (e) => {
   e.stopPropagation();
   try {
     const res = await fetch(`${API_BASE}/api/mindmap`);
-    const data = await res.json();
-    addDebugLine(`[${ts()}] MINDMAP: ${data.nodes.length} nodes, ${data.edges.length} edges`, 'turn-end');
-    addDebugLine(`  Root: ${data.root}`, 'info');
-    data.nodes.slice(0, 20).forEach(n => {
-      addDebugLine(`  [${n.node_type}] ${n.label}`, 'info');
-    });
-    if (data.nodes.length > 20) {
-      addDebugLine(`  ... and ${data.nodes.length - 20} more nodes`, 'info');
-    }
+    mindmapData = await res.json();
+    addDebugLine(`[${ts()}] MINDMAP: ${mindmapData.nodes.length} nodes, ${mindmapData.edges.length} edges`, 'turn-end');
+    await renderMindmap(mindmapData);
+    mindmapOverlay.classList.remove('hidden');
   } catch(err) {
     addDebugLine(`[${ts()}] MINDMAP ERROR: ${err.message}`, 'error');
   }
+});
+
+document.getElementById('mindmapCloseBtn').addEventListener('click', () => {
+  mindmapOverlay.classList.add('hidden');
+});
+
+document.getElementById('mindmapResetBtn').addEventListener('click', async () => {
+  if (mindmapData) await renderMindmap(mindmapData);
+});
+
+// Audit panel
+const auditOverlay = document.getElementById('auditOverlay');
+const auditContent = document.getElementById('auditContent');
+
+async function loadAuditSessions() {
+  try {
+    const res = await fetch(`${API_BASE}/api/audit/sessions`);
+    const data = await res.json();
+    let html = `<h3>Current Session: ${escapeHtml(data.current_session)}</h3>`;
+    html += `<div style="margin: 10px 0;"><a href="${API_BASE}/api/audit/export/${encodeURIComponent(data.current_session)}" target="_blank">Export Chain of Custody (Current)</a> | <a href="${API_BASE}/api/audit/verify/${encodeURIComponent(data.current_session)}" target="_blank">Verify</a></div>`;
+    if (data.sessions && data.sessions.length > 0) {
+      html += '<h4>All Sessions</h4><ul>';
+      data.sessions.forEach(s => {
+        html += `<li>${escapeHtml(s)} — <a href="${API_BASE}/api/audit/export/${encodeURIComponent(s)}" target="_blank">Export</a> | <a href="${API_BASE}/api/audit/verify/${encodeURIComponent(s)}" target="_blank">Verify</a></li>`;
+      });
+      html += '</ul>';
+    } else {
+      html += '<p>No prior sessions found.</p>';
+    }
+    auditContent.innerHTML = html;
+  } catch(err) {
+    auditContent.innerHTML = `<p class="error">Error loading sessions: ${escapeHtml(err.message)}</p>`;
+  }
+}
+
+document.getElementById('debugAuditBtn').addEventListener('click', async (e) => {
+  e.stopPropagation();
+  await loadAuditSessions();
+  auditOverlay.classList.remove('hidden');
+});
+
+document.getElementById('auditCloseBtn').addEventListener('click', () => {
+  auditOverlay.classList.add('hidden');
+});
+
+document.getElementById('auditRefreshBtn').addEventListener('click', () => {
+  loadAuditSessions();
+});
+
+// Pan / zoom for mindmap
+let mmPanning = false, mmStartX = 0, mmStartY = 0, mmTranslateX = 0, mmTranslateY = 0;
+mindmapContainer.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
+  mmPanning = true;
+  mmStartX = e.clientX - mmTranslateX;
+  mmStartY = e.clientY - mmTranslateY;
+  mindmapContainer.style.cursor = 'grabbing';
+});
+window.addEventListener('mousemove', (e) => {
+  if (!mmPanning) return;
+  mmTranslateX = e.clientX - mmStartX;
+  mmTranslateY = e.clientY - mmStartY;
+  const g = mindmapSvg.querySelector('g');
+  if (g) {
+    const transform = g.getAttribute('transform');
+    const scaleMatch = transform.match(/scale\(([^)]+)\)/);
+    const scale = scaleMatch ? scaleMatch[1] : 1;
+    g.setAttribute('transform', `translate(${mmTranslateX},${mmTranslateY}) scale(${scale})`);
+  }
+});
+window.addEventListener('mouseup', () => {
+  mmPanning = false;
+  mindmapContainer.style.cursor = 'grab';
+});
+mindmapContainer.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const g = mindmapSvg.querySelector('g');
+  if (!g) return;
+  const transform = g.getAttribute('transform');
+  const scaleMatch = transform.match(/scale\(([^)]+)\)/);
+  let scale = parseFloat(scaleMatch ? scaleMatch[1] : 1);
+  scale *= e.deltaY < 0 ? 1.1 : 0.9;
+  scale = Math.max(0.1, Math.min(scale, 5));
+  g.setAttribute('transform', `translate(${mmTranslateX},${mmTranslateY}) scale(${scale})`);
 });
 
 // Load models
@@ -285,6 +528,8 @@ async function sendMessage() {
   setStatus('thinking', 'Thinking...');
   setIterations(0);
 
+  let assistantText = '';
+
   if (evtSource) evtSource.close();
   const url = `${API_BASE}/api/chat?message=${encodeURIComponent(text)}&history=${encodeURIComponent(JSON.stringify(history))}&model=${encodeURIComponent(model)}`;
   evtSource = new EventSource(url);
@@ -298,6 +543,7 @@ async function sendMessage() {
 
   evtSource.addEventListener('text', e => {
     appendMessage('assistant', escapeHtml(e.data));
+    assistantText += e.data;
     addDebugLine(`[${ts()}] TEXT: ${e.data.slice(0, 200)}`, 'response');
   });
 
@@ -346,6 +592,13 @@ async function sendMessage() {
     sendBtn.disabled = false;
     evtSource.close();
     evtSource = null;
+    // Store conversation turn in history
+    history.push({ role: 'user', content: text });
+    history.push({ role: 'assistant', content: assistantText });
+    // Cap history to last 20 turns (40 entries) to avoid token bloat
+    if (history.length > 40) {
+      history = history.slice(-40);
+    }
   });
 
   evtSource.onerror = () => {
@@ -421,6 +674,45 @@ userInput.addEventListener('keydown', e => {
 
 sendBtn.addEventListener('click', sendMessage);
 
+// Direct fetch
+const fetchBtn = document.getElementById('fetchBtn');
+
+fetchBtn.addEventListener('click', async () => {
+  const url = prompt('Enter URL to fetch:');
+  if (!url || !url.trim()) return;
+  fetchBtn.disabled = true;
+  fetchBtn.textContent = '...';
+  try {
+    const res = await fetch(`${API_BASE}/api/fetch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url: url.trim() })
+    });
+    const data = await res.json();
+    let display = '';
+    if (data.error) {
+      display = `<strong>Fetch Error</strong><br><pre>${escapeHtml(data.error)}</pre>`;
+    } else if (data.type === 'image') {
+      display = `<strong>Image fetched</strong> (${escapeHtml(data.mime_type)}, ${data.size} bytes)<br><img src="data:${escapeHtml(data.mime_type)};base64,${data.base64}" style="max-width:100%;max-height:400px;">`;
+    } else if (data.type === 'pdf') {
+      const text = escapeHtml(data.content?.substring(0, 2000) || '');
+      display = `<strong>PDF fetched</strong> (${data.size} bytes)<br><pre>${text}</pre>`;
+    } else {
+      const text = escapeHtml(data.content?.substring(0, 2000) || '');
+      display = `<strong>Fetched</strong> (${escapeHtml(data.type)}, ${data.size} bytes)<br><pre>${text}</pre>`;
+    }
+    appendMessage('user', escapeHtml(`Fetch: ${url.trim()}`));
+    appendMessage('assistant', display);
+    addDebugLine(`[${ts()}] DIRECT_FETCH: ${url.trim()} (${data.type || 'error'})`, data.error ? 'error' : 'info');
+  } catch (err) {
+    addMessage('assistant', `**Fetch Error**\n\n${err.message}`);
+    addDebugLine(`[${ts()}] DIRECT_FETCH ERROR: ${err.message}`, 'error');
+  } finally {
+    fetchBtn.disabled = false;
+    fetchBtn.innerHTML = '&#x2193;';
+  }
+});
+
 // Settings panel
 const settingsBtn = document.getElementById('settingsBtn');
 const settingsPanel = document.getElementById('settingsPanel');
@@ -483,12 +775,13 @@ window._webFetchConfig = {
 
 async function renderSettings() {
   try {
-    const [aboutRes, permsRes, fsRes, toolsRes, webRes] = await Promise.all([
+    const [aboutRes, permsRes, fsRes, toolsRes, webRes, auditRes] = await Promise.all([
       fetch(`${API_BASE}/api/about`),
       fetch(`${API_BASE}/api/permissions`),
       fetch(`${API_BASE}/api/fs/config`),
       fetch(`${API_BASE}/api/tools`),
       fetch(`${API_BASE}/api/web/config`),
+      fetch(`${API_BASE}/api/audit/config`),
     ]);
     const about = await aboutRes.json();
     const permsData = await permsRes.json();
@@ -496,6 +789,7 @@ async function renderSettings() {
     const fs = await fsRes.json();
     const toolsData = await toolsRes.json();
     const web = await webRes.json();
+    const audit = await auditRes.json();
     window._plugins = toolsData.tools || [];
     window._fsConfig = {
       default_policy: fs.default_policy || 'deny',
@@ -512,6 +806,10 @@ async function renderSettings() {
       max_size_mb: web.max_size_mb ?? 5,
       respect_robots_txt: web.respect_robots_txt ?? true,
       rate_limit_ms: web.rate_limit_ms ?? 1000
+    };
+    window._auditConfig = {
+      warm_enabled: audit.warm_enabled ?? true,
+      cold_enabled: audit.cold_enabled ?? true
     };
 
     let permsHtml = '';
@@ -657,6 +955,22 @@ async function renderSettings() {
             <button onclick="addDomain('blocked')">Add</button>
           </div>
           <div class="fs-save-msg" id="webFetchSaveMsg"></div>
+        </div>
+      </div>
+
+      <div class="settings-expandable" id="auditLogSection">
+        <div class="settings-expandable-header" onclick="toggleSettingsExpandable('auditLogSection')">
+          <span>Audit Log</span>
+          <span class="arrow">&#9654;</span>
+        </div>
+        <div class="settings-expandable-body">
+          <div class="fs-control">
+            <label><input type="checkbox" id="auditWarm" ${window._auditConfig.warm_enabled ? 'checked' : ''} onchange="toggleAuditWarm()" /> Enable warm tier archiving</label>
+          </div>
+          <div class="fs-control">
+            <label><input type="checkbox" id="auditCold" ${window._auditConfig.cold_enabled ? 'checked' : ''} onchange="toggleAuditCold()" /> Enable cold tier archiving</label>
+          </div>
+          <div class="fs-save-msg" id="auditSaveMsg"></div>
         </div>
       </div>
 
@@ -958,6 +1272,35 @@ function refreshWebFetchSection() {
     </div>
     <div class="fs-save-msg" id="webFetchSaveMsg"></div>
   `;
+}
+
+async function saveAuditConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/audit/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(window._auditConfig)
+    });
+    const data = await res.json();
+    const msg = document.getElementById('auditSaveMsg');
+    if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
+    if (data.ok) setTimeout(() => { const m = document.getElementById('auditSaveMsg'); if (m) m.textContent = ''; }, 2000);
+  } catch(e) {
+    const msg = document.getElementById('auditSaveMsg');
+    if (msg) msg.textContent = 'Save failed: ' + e.message;
+  }
+}
+
+function toggleAuditWarm() {
+  const cb = document.getElementById('auditWarm');
+  window._auditConfig.warm_enabled = cb ? cb.checked : true;
+  saveAuditConfig();
+}
+
+function toggleAuditCold() {
+  const cb = document.getElementById('auditCold');
+  window._auditConfig.cold_enabled = cb ? cb.checked : true;
+  saveAuditConfig();
 }
 
 function toggleSettingsExpandable(id) {

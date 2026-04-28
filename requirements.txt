@@ -1,0 +1,63 @@
+# Avalon Requirements
+
+This file lists the dependencies required to build and run Avalon.
+
+## System Dependencies
+
+| Tool | Version | Purpose | Install Link |
+|------|---------|---------|-------------|
+| Rust | 1.75+ | Backend compiler | https://rustup.rs |
+| Node.js | 22.x LTS | Frontend runtime | https://nodejs.org |
+| npm | 10.x+ | Frontend package manager | Included with Node.js |
+| Ollama | Latest | Local LLM inference (optional) | https://ollama.com |
+
+## Rust Crates
+
+Backend dependencies are managed by Cargo in `Cargo.toml`:
+
+```
+actix-web = "4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+actix-cors = "0.7"
+futures-util = "0.3"
+regex = "1"
+zip = "2"
+base64 = "0.22"
+lopdf = "0.34"
+sha2 = "0.10"
+hex = "0.4"
+flate2 = "1"
+tar = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+```
+
+Install them automatically with:
+
+```bash
+cargo build --release
+```
+
+## Node Packages
+
+Frontend dependencies are managed by npm in `client/package.json`:
+
+```
+electron = "^30.0.0"
+```
+
+Install them automatically with:
+
+```bash
+cd client && npm install
+```
+
+## Python
+
+The optional launcher (`launch.py`) uses only the Python standard library.
+No third-party Python packages are required.
+
+If you extend Avalon with Python scripts, add them here.

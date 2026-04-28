@@ -1,6 +1,7 @@
 mod fs;
 mod tools;
 mod mindmap;
+mod audit;
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer};
@@ -14,12 +15,20 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use audit::AuditLog;
 use fs::{FileSystemService, FileSystemConfig};
 use mindmap::MindMapService;
+use crate::tools::Tool;
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Data Contracts
 // ═════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ChatHistoryEntry {
+    pub role: String,
+    pub content: String,
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct InferenceRequest {
@@ -36,6 +45,8 @@ pub struct InferenceRequest {
     model_params: serde_json::Value,
     #[serde(default = "default_ai_name")]
     ai_name: String,
+    #[serde(default)]
+    history: Vec<ChatHistoryEntry>,
 }
 
 fn default_ai_name() -> String { "Avalon".to_string() }
@@ -183,88 +194,8 @@ impl SessionPermissionManager {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Debug Log
+// Audit Log (see audit.rs for implementation)
 // ═════════════════════════════════════════════════════════════════════════════
-
-#[derive(Debug, Clone, Serialize)]
-pub struct DebugEntry {
-    #[serde(rename = "type")]
-    entry_type: String,
-    data: serde_json::Value,
-}
-
-pub struct DebugLog {
-    entries: Vec<DebugEntry>,
-    max_size: usize,
-}
-
-impl DebugLog {
-    pub fn new() -> Self {
-        DebugLog {
-            entries: Vec::new(),
-            max_size: 10000,
-        }
-    }
-
-    pub fn push(&mut self, entry_type: &str, data: serde_json::Value) {
-        self.entries.push(DebugEntry {
-            entry_type: entry_type.to_string(),
-            data,
-        });
-        if self.entries.len() > self.max_size {
-            let excess = self.entries.len() - self.max_size;
-            self.entries.drain(0..excess);
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.entries.clear();
-    }
-
-    pub fn get_all(&self) -> &Vec<DebugEntry> {
-        &self.entries
-    }
-
-    pub fn save_to_file(&self) -> Result<String, String> {
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        let filename = format!("avalon-debug-{}.md", timestamp);
-        let project_dir = std::env::current_exe()
-            .ok()
-            .and_then(|p| {
-                let mut path = p;
-                path.pop(); // target/release
-                path.pop(); // target
-                path.pop(); // project root
-                Some(path)
-            })
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-        let logs_dir = project_dir.join("logs");
-        if let Err(e) = std::fs::create_dir_all(&logs_dir) {
-            return Err(format!("Failed to create logs directory: {}", e));
-        }
-        let path = logs_dir.join(&filename);
-
-        let mut md = String::new();
-        md.push_str(&format!("# Avalon Debug Log\n\n"));
-        md.push_str(&format!("**Generated:** {}\n\n", timestamp));
-        md.push_str("---\n\n");
-
-        for entry in &self.entries {
-            md.push_str(&format!("## {}\n\n", entry.entry_type));
-            if let Ok(pretty) = serde_json::to_string_pretty(&entry.data) {
-                md.push_str("```json\n");
-                md.push_str(&pretty);
-                md.push_str("\n```\n\n");
-            } else {
-                md.push_str(&format!("```\n{:?}\n```\n\n", entry.data));
-            }
-        }
-
-        std::fs::write(&path, md)
-            .map_err(|e| format!("Failed to write debug log: {}", e))?;
-        Ok(path.to_string_lossy().to_string())
-    }
-}
 
 // ═════════════════════════════════════════════════════════════════════════════
 // App Config
@@ -277,6 +208,7 @@ pub struct AppConfig {
     pub active_tools: Vec<String>,
     pub ai_name: String,
     pub web_fetch: WebFetchConfig,
+    pub audit: AuditConfig,
 }
 
 impl AppConfig {
@@ -296,13 +228,50 @@ impl AppConfig {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Avalon".to_string());
         let web_fetch = WebFetchConfig::load();
+        let audit = AuditConfig::load();
         AppConfig {
             current_model,
             api_base: env::var("AVALON_MODEL_API_BASE").unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             active_tools,
             ai_name,
             web_fetch,
+            audit,
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Audit Config
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AuditConfig {
+    pub warm_enabled: bool,
+    pub cold_enabled: bool,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        AuditConfig {
+            warm_enabled: true,
+            cold_enabled: true,
+        }
+    }
+}
+
+impl AuditConfig {
+    pub fn load() -> Self {
+        let persisted = ConfigStore::load();
+        persisted.get("audit")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let mut persisted = ConfigStore::load();
+        persisted.insert("audit".to_string(), json!(self));
+        ConfigStore::save(&persisted);
+        Ok(())
     }
 }
 
@@ -420,17 +389,17 @@ impl HttpModelService {
     fn new() -> Result<Self, String> {
         let api_key = env::var("AVALON_MODEL_API_KEY").unwrap_or_default();
         let api_base = env::var("AVALON_MODEL_API_BASE")
-            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string());
+            .unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
         let raw_base = if api_base.ends_with("/v1") {
             api_base[..api_base.len() - 3].to_string()
         } else {
             api_base.clone()
         };
         let model_name = env::var("AVALON_MODEL_NAME")
-            .unwrap_or_else(|_| "gpt-4o-mini".to_string());
+            .unwrap_or_else(|_| "llama3".to_string());
 
         let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(120))
+            .timeout(Duration::from_secs(600))
             .build()
             .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
 
@@ -504,7 +473,15 @@ impl HttpModelService {
             "content": content_parts
         });
 
-        vec![system_msg, user_msg]
+        let mut messages = vec![system_msg];
+        for entry in &req.history {
+            messages.push(json!({
+                "role": entry.role.clone(),
+                "content": entry.content.clone()
+            }));
+        }
+        messages.push(user_msg);
+        messages
     }
 
     async fn ollama_list_models(&self) -> Result<Vec<String>, String> {
@@ -845,7 +822,7 @@ async fn get_mindmap(
 
 async fn list_models(
     model_service: web::Data<Box<dyn ModelInferenceService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let svc = match model_service.as_any().downcast_ref::<HttpModelService>() {
         Some(svc) => svc,
@@ -857,7 +834,7 @@ async fn list_models(
     match svc.ollama_list_models().await {
         Ok(models) => HttpResponse::Ok().json(json!({ "models": models })),
         Err(e) => {
-            debug_log.lock().unwrap().push("error", json!({ "message": e }));
+            audit_log.lock().unwrap().push("error", json!({ "message": e }));
             let current = svc.model_name();
             HttpResponse::Ok().json(json!({ "models": [current] }))
         }
@@ -922,7 +899,7 @@ fn has_exploratory_intent(text: &str) -> bool {
 async fn chat_handler(
     query: web::Query<HashMap<String, String>>,
     model_service: web::Data<Box<dyn ModelInferenceService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
     config: web::Data<Mutex<AppConfig>>,
     fs: web::Data<Mutex<FileSystemService>>,
     registry: web::Data<Mutex<tools::ToolRegistry>>,
@@ -941,25 +918,37 @@ async fn chat_handler(
 
     let ai_name = config.lock().unwrap().ai_name.clone();
 
+    // ── Parse conversation history ──
+    let history: Vec<ChatHistoryEntry> = query.get("history")
+        .and_then(|h| serde_json::from_str(h).ok())
+        .unwrap_or_default();
+
     // ── Intent detection: pre-build mind map for exploratory queries ──
     let mindmap_payload = if has_exploratory_intent(&message) {
-        debug_log.lock().unwrap().push("mindmap_build", json!({"reason": "exploratory_intent_detected", "query": &message}));
+        audit_log.lock().unwrap().push("mindmap_build", json!({"reason": "exploratory_intent_detected", "query": &message}));
         let fs_svc = fs.lock().unwrap();
         let mut mm = MindMapService::new();
         let allowed: Vec<String> = fs_svc.config().allowed_paths.clone();
         mm.build(&allowed, 3);
         let payload = serde_json::to_value(mm.graph()).unwrap_or(serde_json::Value::Null);
-        debug_log.lock().unwrap().push("mindmap_build", json!({"nodes": mm.graph().nodes.len(), "edges": mm.graph().edges.len()}));
+        audit_log.lock().unwrap().push("mindmap_build", json!({"nodes": mm.graph().nodes.len(), "edges": mm.graph().edges.len()}));
         payload
     } else {
         serde_json::Value::Null
     };
+
+    // ── Log user message ──
+    audit_log.lock().unwrap().push_user("user_message", json!({
+        "message": &message,
+        "model": &selected_model
+    }));
 
     // ── First inference turn ──
     let req = InferenceRequest {
         prompt: message,
         user_context: String::new(),
         mindmap_payload,
+        history: history.clone(),
         image_archives: Vec::new(),
         other_instances: serde_json::Value::Null,
         model_params: json!({"model": selected_model}),
@@ -999,7 +988,7 @@ async fn chat_handler(
             let is_core = registry.get(&call.name).map(|t| t.is_core()).unwrap_or(false);
             if !active_set.contains(&call.name) && !is_core {
                 let e = format!("Tool '{}' is deactivated. Activate it in Settings > Plugins to use it.", call.name);
-                debug_log.lock().unwrap().push("tool_error", json!({
+                audit_log.lock().unwrap().push_assistant("tool_error", json!({
                     "tool": call.name,
                     "input": call.input,
                     "error": &e
@@ -1020,7 +1009,7 @@ async fn chat_handler(
                 Some(tool) => {
                     match tool.execute(call.input.clone(), &tools::ToolContext { fs: &fs_svc, web_fetch: &cfg.web_fetch }).await {
                         Ok(result) => {
-                            debug_log.lock().unwrap().push("tool_call", json!({
+                            audit_log.lock().unwrap().push_assistant("tool_call", json!({
                                 "tool": call.name,
                                 "input": call.input,
                                 "success": true,
@@ -1038,7 +1027,7 @@ async fn chat_handler(
                             }));
                         }
                         Err(e) => {
-                            debug_log.lock().unwrap().push("tool_error", json!({
+                            audit_log.lock().unwrap().push_assistant("tool_error", json!({
                                 "tool": call.name,
                                 "input": call.input,
                                 "error": e
@@ -1058,7 +1047,7 @@ async fn chat_handler(
                 }
                 None => {
                     let e = format!("Unknown tool: {}", call.name);
-                    debug_log.lock().unwrap().push("tool_error", json!({
+                    audit_log.lock().unwrap().push("tool_error", json!({
                         "tool": call.name,
                         "input": call.input,
                         "error": &e
@@ -1097,6 +1086,7 @@ async fn chat_handler(
             other_instances: serde_json::Value::Null,
             model_params: json!({"model": selected_model}),
             ai_name: ai_name.clone(),
+            history: history.clone(),
         };
 
         let follow_up_raw = match model_service.infer(&follow_up_req).await {
@@ -1111,13 +1101,13 @@ async fn chat_handler(
         (r, clean_response(&ans))
     };
 
-    // Log
+    // Log assistant response
     {
-        let mut log = debug_log.lock().unwrap();
+        let mut log = audit_log.lock().unwrap();
         if let Some(ref r) = reasoning {
-            log.push("reasoning", json!({ "text": r }));
+            log.push_assistant("reasoning", json!({ "text": r }));
         }
-        log.push("api_response", json!({
+        log.push_assistant("api_response", json!({
             "elapsed_ms": 500,
             "stop_reason": "end_turn",
             "content": [{"type": "text", "text": &final_answer}]
@@ -1141,20 +1131,52 @@ async fn chat_handler(
         .streaming(stream)
 }
 
-async fn get_debug(debug_log: web::Data<Mutex<DebugLog>>) -> HttpResponse {
-    let log = debug_log.lock().unwrap();
+async fn get_debug(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
+    let log = audit_log.lock().unwrap();
     HttpResponse::Ok().json(json!({ "log": log.get_all() }))
 }
 
-async fn clear_debug(debug_log: web::Data<Mutex<DebugLog>>) -> HttpResponse {
-    debug_log.lock().unwrap().clear();
+async fn clear_debug(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
+    audit_log.lock().unwrap().clear();
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
-async fn save_debug(debug_log: web::Data<Mutex<DebugLog>>) -> HttpResponse {
-    match debug_log.lock().unwrap().save_to_file() {
+async fn save_debug(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
+    match audit_log.lock().unwrap().save_to_file() {
         Ok(path) => HttpResponse::Ok().json(json!({ "ok": true, "path": path })),
         Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+// Audit endpoints
+
+async fn list_audit_sessions(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
+    let log = audit_log.lock().unwrap();
+    HttpResponse::Ok().json(json!({ "sessions": log.list_sessions(), "current_session": log.session_id() }))
+}
+
+async fn verify_audit_session(
+    path: web::Path<String>,
+    audit_log: web::Data<Mutex<AuditLog>>,
+) -> HttpResponse {
+    let log = audit_log.lock().unwrap();
+    match log.verify_session(&path.into_inner()) {
+        Ok(report) => HttpResponse::Ok().json(report),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": e })),
+    }
+}
+
+async fn export_audit_coc(
+    path: web::Path<String>,
+    audit_log: web::Data<Mutex<AuditLog>>,
+) -> HttpResponse {
+    let log = audit_log.lock().unwrap();
+    match log.export_chain_of_custody(&path.into_inner()) {
+        Ok(md) => HttpResponse::Ok()
+            .content_type("text/markdown")
+            .insert_header(("Content-Disposition", "attachment; filename=chain-of-custody.md"))
+            .body(md),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": e })),
     }
 }
 
@@ -1168,7 +1190,7 @@ async fn post_permission(
     body: web::Json<PermissionRequest>,
     session_perms: web::Data<Mutex<SessionPermissionManager>>,
     security: web::Data<Mutex<SecurityManager>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let mut perms = session_perms.lock().unwrap();
     let tool = body.tool.clone().unwrap_or_else(|| "unknown".to_string());
@@ -1176,14 +1198,14 @@ async fn post_permission(
     if body.allowed {
         perms.approve(&tool, AccessPermissions::ReadWrite);
         security.lock().unwrap().register_permission(&tool, "*", AccessPermissions::ReadWrite);
-        debug_log.lock().unwrap().push("permission_decision", json!({
+        audit_log.lock().unwrap().push_user("permission_decision", json!({
             "tool": &tool,
             "allowed": true
         }));
         HttpResponse::Ok().json(json!({ "ok": true, "status": "approved" }))
     } else {
         perms.deny(&tool);
-        debug_log.lock().unwrap().push("permission_denied", json!({ "tool": &tool }));
+        audit_log.lock().unwrap().push_user("permission_denied", json!({ "tool": &tool }));
         HttpResponse::Ok().json(json!({ "ok": true, "status": "denied" }))
     }
 }
@@ -1199,12 +1221,12 @@ async fn revoke_permission(
     path: web::Path<String>,
     session_perms: web::Data<Mutex<SessionPermissionManager>>,
     security: web::Data<Mutex<SecurityManager>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let tool = path.into_inner();
     session_perms.lock().unwrap().revoke(&tool);
     security.lock().unwrap().remove_permission(&tool, "*");
-    debug_log.lock().unwrap().push("permission_revoked", json!({ "tool": &tool }));
+    audit_log.lock().unwrap().push_user("permission_revoked", json!({ "tool": &tool }));
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
@@ -1236,16 +1258,38 @@ struct FsDeleteRequest {
 async fn fs_read(
     body: web::Json<FsReadRequest>,
     fs: web::Data<Mutex<FileSystemService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let result = fs.lock().unwrap().read_file(&body.path);
-    debug_log.lock().unwrap().push("tool_call", json!({
+    audit_log.lock().unwrap().push("tool_call", json!({
         "tool": "read_file",
         "input": { "path": &body.path },
         "success": result.success
     }));
     if let Some(ref err) = result.error {
-        debug_log.lock().unwrap().push("tool_error", json!({ "tool": "read_file", "error": err }));
+        audit_log.lock().unwrap().push("tool_error", json!({ "tool": "read_file", "error": err }));
+    }
+    HttpResponse::Ok().json(result)
+}
+
+#[derive(Debug, Deserialize)]
+struct FsImageRequest {
+    path: String,
+}
+
+async fn fs_image(
+    body: web::Json<FsImageRequest>,
+    fs: web::Data<Mutex<FileSystemService>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
+) -> HttpResponse {
+    let result = fs.lock().unwrap().read_image(&body.path);
+    audit_log.lock().unwrap().push("tool_call", json!({
+        "tool": "read_image",
+        "input": { "path": &body.path },
+        "success": result.success
+    }));
+    if let Some(ref err) = result.error {
+        audit_log.lock().unwrap().push("tool_error", json!({ "tool": "read_image", "error": err }));
     }
     HttpResponse::Ok().json(result)
 }
@@ -1253,16 +1297,16 @@ async fn fs_read(
 async fn fs_write(
     body: web::Json<FsWriteRequest>,
     fs: web::Data<Mutex<FileSystemService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let result = fs.lock().unwrap().write_file(&body.path, &body.content);
-    debug_log.lock().unwrap().push("tool_call", json!({
+    audit_log.lock().unwrap().push("tool_call", json!({
         "tool": "write_file",
         "input": { "path": &body.path },
         "success": result.success
     }));
     if let Some(ref err) = result.error {
-        debug_log.lock().unwrap().push("tool_error", json!({ "tool": "write_file", "error": err }));
+        audit_log.lock().unwrap().push("tool_error", json!({ "tool": "write_file", "error": err }));
     }
     HttpResponse::Ok().json(result)
 }
@@ -1270,16 +1314,16 @@ async fn fs_write(
 async fn fs_list(
     body: web::Json<FsListRequest>,
     fs: web::Data<Mutex<FileSystemService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let result = fs.lock().unwrap().list_dir(&body.path);
-    debug_log.lock().unwrap().push("tool_call", json!({
+    audit_log.lock().unwrap().push("tool_call", json!({
         "tool": "list_dir",
         "input": { "path": &body.path },
         "success": result.success
     }));
     if let Some(ref err) = result.error {
-        debug_log.lock().unwrap().push("tool_error", json!({ "tool": "list_dir", "error": err }));
+        audit_log.lock().unwrap().push("tool_error", json!({ "tool": "list_dir", "error": err }));
     }
     HttpResponse::Ok().json(result)
 }
@@ -1287,16 +1331,16 @@ async fn fs_list(
 async fn fs_delete(
     body: web::Json<FsDeleteRequest>,
     fs: web::Data<Mutex<FileSystemService>>,
-    debug_log: web::Data<Mutex<DebugLog>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
 ) -> HttpResponse {
     let result = fs.lock().unwrap().delete_file(&body.path);
-    debug_log.lock().unwrap().push("tool_call", json!({
+    audit_log.lock().unwrap().push("tool_call", json!({
         "tool": "delete_file",
         "input": { "path": &body.path },
         "success": result.success
     }));
     if let Some(ref err) = result.error {
-        debug_log.lock().unwrap().push("tool_error", json!({ "tool": "delete_file", "error": err }));
+        audit_log.lock().unwrap().push("tool_error", json!({ "tool": "delete_file", "error": err }));
     }
     HttpResponse::Ok().json(result)
 }
@@ -1319,6 +1363,44 @@ async fn fs_config_post(
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
+#[derive(Debug, Deserialize)]
+struct DirectFetchRequest {
+    url: String,
+}
+
+async fn direct_fetch(
+    body: web::Json<DirectFetchRequest>,
+    config: web::Data<Mutex<AppConfig>>,
+    audit_log: web::Data<Mutex<AuditLog>>,
+) -> HttpResponse {
+    let cfg = config.lock().unwrap();
+    let fs_svc = fs::FileSystemService::new();
+    let ctx = tools::ToolContext {
+        fs: &fs_svc,
+        web_fetch: &cfg.web_fetch,
+    };
+    let tool = tools::fetch_tool::FetchUrlTool;
+    let input = json!({ "url": body.url });
+    match tool.execute(input, &ctx).await {
+        Ok(result) => {
+            audit_log.lock().unwrap().push("direct_fetch", json!({
+                "url": body.url,
+                "success": true,
+                "type": result.get("type").and_then(|v| v.as_str()).unwrap_or("unknown")
+            }));
+            HttpResponse::Ok().json(result)
+        }
+        Err(e) => {
+            audit_log.lock().unwrap().push("direct_fetch", json!({
+                "url": body.url,
+                "success": false,
+                "error": &e
+            }));
+            HttpResponse::Ok().json(json!({ "error": e }))
+        }
+    }
+}
+
 async fn web_config_get(config: web::Data<Mutex<AppConfig>>) -> HttpResponse {
     let cfg = config.lock().unwrap();
     HttpResponse::Ok().json(&cfg.web_fetch)
@@ -1331,6 +1413,23 @@ async fn web_config_post(
     let mut cfg = config.lock().unwrap();
     cfg.web_fetch = body.into_inner();
     if let Err(e) = cfg.web_fetch.save() {
+        return HttpResponse::InternalServerError().json(json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(json!({ "ok": true }))
+}
+
+async fn audit_config_get(config: web::Data<Mutex<AppConfig>>) -> HttpResponse {
+    let cfg = config.lock().unwrap();
+    HttpResponse::Ok().json(&cfg.audit)
+}
+
+async fn audit_config_post(
+    body: web::Json<AuditConfig>,
+    config: web::Data<Mutex<AppConfig>>,
+) -> HttpResponse {
+    let mut cfg = config.lock().unwrap();
+    cfg.audit = body.into_inner();
+    if let Err(e) = cfg.audit.save() {
         return HttpResponse::InternalServerError().json(json!({ "error": e }));
     }
     HttpResponse::Ok().json(json!({ "ok": true }))
@@ -1409,7 +1508,7 @@ async fn main() -> std::io::Result<()> {
     let active_tools_set: std::collections::HashSet<String> = config.active_tools.iter().cloned().collect();
     let active_tools_list: Vec<&str> = all_tool_names.iter().filter(|name| active_tools_set.contains(*name)).map(|s| s.as_str()).collect();
     let tools_list = active_tools_list.join(", ");
-    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nUse fetch_url to download content from a public URL. Supports text and images (returned as base64). Respects domain allow-lists, size limits, and timeouts configured in Settings > Web Fetch. Only activate this tool if the user explicitly asks you to read a remote file or image.\n\nUse remote_mindmap to download an entire public GitHub repository as a zip, build a structural graph from it, merge it with the local mindmap, then delete the temporary download. Max 25 MB. This is useful for comparing your local project with an open-source dependency or reference implementation.
+    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nUse fetch_url to download content from a public URL. Supports plain text, images (returned as base64), and PDFs (text is safely extracted as plain text using a parser — no scripts or embedded objects are executed). Respects domain allow-lists, size limits, and timeouts configured in Settings > Web Fetch. Only activate this tool if the user explicitly asks you to read a remote file, image, or document.\n\nUse remote_mindmap to download an entire public GitHub repository as a zip, build a structural graph from it, merge it with the local mindmap, then delete the temporary download. Max 25 MB. This is useful for comparing your local project with an open-source dependency or reference implementation.
 
 Use web_scrape to recursively scrape a website starting from a URL, extracting text and image references up to the configured max depth. Respects robots.txt, rate limits, and domain restrictions.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
 
@@ -1427,7 +1526,7 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
 
     let model_service_data = web::Data::new(model_service);
     let security_data = web::Data::new(Mutex::new(SecurityManager::new()));
-    let debug_log_data = web::Data::new(Mutex::new(DebugLog::new()));
+    let audit_log_data = web::Data::new(Mutex::new(AuditLog::new()));
     let session_perms_data = web::Data::new(Mutex::new(SessionPermissionManager::new()));
     let config_data = web::Data::new(Mutex::new(config));
     let fs_data = web::Data::new(Mutex::new(FileSystemService::new()));
@@ -1453,7 +1552,7 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             .wrap(cors)
             .app_data(model_service_data.clone())
             .app_data(security_data.clone())
-            .app_data(debug_log_data.clone())
+            .app_data(audit_log_data.clone())
             .app_data(session_perms_data.clone())
             .app_data(config_data.clone())
             .app_data(fs_data.clone())
@@ -1473,6 +1572,9 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             .service(web::resource("/api/debug").route(web::get().to(get_debug)))
             .service(web::resource("/api/debug/clear").route(web::post().to(clear_debug)))
             .service(web::resource("/api/debug/save").route(web::post().to(save_debug)))
+            .service(web::resource("/api/audit/sessions").route(web::get().to(list_audit_sessions)))
+            .service(web::resource("/api/audit/verify/{session_id}").route(web::get().to(verify_audit_session)))
+            .service(web::resource("/api/audit/export/{session_id}").route(web::get().to(export_audit_coc)))
             .service(web::resource("/api/permission").route(web::post().to(post_permission)))
             .service(web::resource("/api/permissions").route(web::get().to(get_permissions)))
             .service(web::resource("/api/permissions/{tool}").route(web::delete().to(revoke_permission)))
@@ -1487,6 +1589,7 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             .service(web::resource("/api/mindmap").route(web::get().to(get_mindmap)))
             // File system endpoints
             .service(web::resource("/api/fs/read").route(web::post().to(fs_read)))
+            .service(web::resource("/api/fs/image").route(web::post().to(fs_image)))
             .service(web::resource("/api/fs/write").route(web::post().to(fs_write)))
             .service(web::resource("/api/fs/list").route(web::post().to(fs_list)))
             .service(web::resource("/api/fs/delete").route(web::post().to(fs_delete)))
@@ -1500,6 +1603,12 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
                     .route(web::get().to(web_config_get))
                     .route(web::post().to(web_config_post))
             )
+            .service(
+                web::resource("/api/audit/config")
+                    .route(web::get().to(audit_config_get))
+                    .route(web::post().to(audit_config_post))
+            )
+            .service(web::resource("/api/fetch").route(web::post().to(direct_fetch)))
     })
     .bind("127.0.0.1:8080")?
     .run()

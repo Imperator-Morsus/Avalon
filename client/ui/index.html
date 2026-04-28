@@ -36,6 +36,7 @@
 
     <div class="input-bar">
       <textarea id="userInput" rows="1" placeholder="Ask anything..." autofocus></textarea>
+      <button class="fetch-btn" id="fetchBtn" title="Direct Fetch">&#x2193;</button>
       <button class="send-btn" id="sendBtn">Send</button>
     </div>
   </div>
@@ -48,6 +49,40 @@
     <div class="settings-body" id="settingsBody"></div>
   </div>
 
+  <!-- Mindmap viewer -->
+  <div class="mindmap-overlay hidden" id="mindmapOverlay">
+    <div class="mindmap-header">
+      <span>Mind Map</span>
+      <div class="mindmap-actions">
+        <button id="mindmapResetBtn">Reset</button>
+        <button id="mindmapCloseBtn">&#x2715;</button>
+      </div>
+    </div>
+    <div class="mindmap-container" id="mindmapContainer">
+      <svg id="mindmapSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+    </div>
+    <div class="mindmap-legend">
+      <span><span class="legend-dot dir"></span> Directory</span>
+      <span><span class="legend-dot file"></span> File</span>
+      <span><span class="legend-dot image"></span> Image</span>
+      <span><span class="legend-dot root"></span> Root</span>
+    </div>
+  </div>
+
+  <!-- Audit overlay -->
+  <div class="mindmap-overlay hidden" id="auditOverlay">
+    <div class="mindmap-header">
+      <span>Audit Sessions</span>
+      <div class="mindmap-actions">
+        <button id="auditRefreshBtn">Refresh</button>
+        <button id="auditCloseBtn">&#x2715;</button>
+      </div>
+    </div>
+    <div class="mindmap-container" id="auditContainer" style="padding: 20px; overflow-y: auto;">
+      <div id="auditContent"></div>
+    </div>
+  </div>
+
   <!-- Debug panel -->
   <div class="debug-panel collapsed" id="debugPanel">
     <div class="debug-toggle" id="debugToggle">
@@ -55,6 +90,7 @@
       <span class="debug-label">Debug</span>
       <div class="debug-header-actions">
         <button class="debug-btn" id="debugMindMapBtn">Mindmap</button>
+        <button class="debug-btn" id="debugAuditBtn">Audit</button>
         <button class="debug-btn" id="debugSaveBtn">Save</button>
         <button class="debug-btn" id="debugClearBtn">Clear</button>
       </div>

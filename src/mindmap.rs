@@ -106,7 +106,7 @@ impl MindMapService {
                                 queue.push((entry_str.clone(), depth + 1));
                             }
                             self.add_edge(&path_str, &entry_str, "contains");
-                        } else if is_source_file(&entry_path) {
+                        } else if is_source_file(&entry_path) || is_image_file(&entry_path) {
                             if depth < max_depth {
                                 queue.push((entry_str.clone(), depth + 1));
                             }
@@ -114,60 +114,68 @@ impl MindMapService {
                         }
                     }
                 }
-            } else if path.is_file() && is_source_file(path) {
-                self.add_node(&path_str, node_name(path), "file");
+            } else if path.is_file() && (is_source_file(path) || is_image_file(path)) {
+                if is_image_file(path) {
+                    let mut meta = HashMap::new();
+                    meta.insert("image_path".to_string(), path_str.clone());
+                    self.add_node_with_metadata(&path_str, node_name(path), "image", meta);
+                } else {
+                    self.add_node(&path_str, node_name(path), "file");
+                }
 
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+                if !is_image_file(path) {
+                    if let Ok(content) = std::fs::read_to_string(path) {
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-                    match ext {
-                        "rs" => {
-                            for cap in re_rust_use.captures_iter(&content) {
-                                if let Some(m) = cap.get(1) {
-                                    let import = m.as_str();
-                                    let target = resolve_rust_import(path, import);
-                                    if !target.is_empty() && target != path_str {
-                                        self.ensure_node(&target, "file");
-                                        self.add_edge(&path_str, &target, "imports");
+                        match ext {
+                            "rs" => {
+                                for cap in re_rust_use.captures_iter(&content) {
+                                    if let Some(m) = cap.get(1) {
+                                        let import = m.as_str();
+                                        let target = resolve_rust_import(path, import);
+                                        if !target.is_empty() && target != path_str {
+                                            self.ensure_node(&target, "file");
+                                            self.add_edge(&path_str, &target, "imports");
+                                        }
+                                    }
+                                }
+                                for cap in re_rust_mod.captures_iter(&content) {
+                                    if let Some(m) = cap.get(1) {
+                                        let mod_name = m.as_str();
+                                        let target = resolve_rust_mod(path, mod_name);
+                                        if !target.is_empty() && target != path_str {
+                                            self.ensure_node(&target, "file");
+                                            self.add_edge(&path_str, &target, "contains");
+                                        }
                                     }
                                 }
                             }
-                            for cap in re_rust_mod.captures_iter(&content) {
-                                if let Some(m) = cap.get(1) {
-                                    let mod_name = m.as_str();
-                                    let target = resolve_rust_mod(path, mod_name);
-                                    if !target.is_empty() && target != path_str {
-                                        self.ensure_node(&target, "file");
-                                        self.add_edge(&path_str, &target, "contains");
+                            "js" | "ts" | "jsx" | "tsx" | "mjs" => {
+                                for cap in re_js_import.captures_iter(&content) {
+                                    let import = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str());
+                                    if let Some(imp) = import {
+                                        let target = resolve_js_import(path, imp);
+                                        if !target.is_empty() && target != path_str {
+                                            self.ensure_node(&target, "file");
+                                            self.add_edge(&path_str, &target, "imports");
+                                        }
                                     }
                                 }
                             }
+                            "py" => {
+                                for cap in re_py_import.captures_iter(&content) {
+                                    let import = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str());
+                                    if let Some(imp) = import {
+                                        let target = resolve_py_import(path, imp);
+                                        if !target.is_empty() && target != path_str {
+                                            self.ensure_node(&target, "file");
+                                            self.add_edge(&path_str, &target, "imports");
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
-                        "js" | "ts" | "jsx" | "tsx" | "mjs" => {
-                            for cap in re_js_import.captures_iter(&content) {
-                                let import = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str());
-                                if let Some(imp) = import {
-                                    let target = resolve_js_import(path, imp);
-                                    if !target.is_empty() && target != path_str {
-                                        self.ensure_node(&target, "file");
-                                        self.add_edge(&path_str, &target, "imports");
-                                    }
-                                }
-                            }
-                        }
-                        "py" => {
-                            for cap in re_py_import.captures_iter(&content) {
-                                let import = cap.get(1).or_else(|| cap.get(2)).map(|m| m.as_str());
-                                if let Some(imp) = import {
-                                    let target = resolve_py_import(path, imp);
-                                    if !target.is_empty() && target != path_str {
-                                        self.ensure_node(&target, "file");
-                                        self.add_edge(&path_str, &target, "imports");
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -198,6 +206,15 @@ impl MindMapService {
     }
 
     fn add_node(&mut self, id: &str, label: String, node_type: &str) {
+        self.add_node_with_metadata(id, label, node_type, HashMap::new());
+    }
+
+    fn add_node_with_metadata(&mut self,
+        id: &str,
+        label: String,
+        node_type: &str,
+        metadata: HashMap<String, String>,
+    ) {
         if self.graph.nodes.iter().any(|n| n.id == id) {
             return;
         }
@@ -205,7 +222,7 @@ impl MindMapService {
             id: id.to_string(),
             label,
             node_type: node_type.to_string(),
-            metadata: HashMap::new(),
+            metadata,
         });
     }
 
@@ -238,6 +255,11 @@ impl MindMapService {
 fn is_source_file(path: &Path) -> bool {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
     matches!(ext, "rs" | "js" | "ts" | "jsx" | "tsx" | "mjs" | "py" | "java" | "go" | "c" | "cpp" | "h" | "hpp" | "md" | "json" | "toml" | "yaml" | "yml")
+}
+
+fn is_image_file(path: &Path) -> bool {
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "svg" | "ico")
 }
 
 fn node_name(path: &Path) -> String {

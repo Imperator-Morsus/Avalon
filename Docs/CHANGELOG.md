@@ -60,12 +60,21 @@ A major expansion of Avalon's network capabilities, moving from hardcoded GitHub
 - Added `base64 = "0.22"` for image base64 encoding.
 - Added `lopdf = "0.34"` for PDF text extraction.
 
+#### Direct Fetch API (`/api/fetch`)
+
+- **New endpoint** `POST /api/fetch` bypasses the AI tool-calling gatekeeping while preserving all backend security.
+- Runs the identical safe fetch pipeline (URL validation, SSRF blocking, content sanitization, size limits, domain checks, PDF text extraction, image base64, HTML sanitization).
+- Returns sanitized content directly to the frontend for user review before it is sent to the model.
+- Useful when models refuse to call `fetch_url` due to baked-in safety training (e.g., PDF fetching on some local models).
+- **Frontend UI:** New &#x2193; (download) button in the chat input bar opens a prompt for a URL, fetches directly, and displays the sanitized result in the chat history.
+
 #### Documentation (`Docs/CAPABILITIES.md`)
 
 - Updated tool descriptions for `fetch_url` and added `web_scrape`.
 - Added the Web Fetch config reference table.
 - Added the full security model table.
 - Added `GET/POST /api/web/config` to the API endpoints list.
+- Added `POST /api/fetch` to the API endpoints list with request/response examples.
 - Added new source files to the Files & Config table.
 - Added Settings panel section mentioning Web Fetch controls.
 

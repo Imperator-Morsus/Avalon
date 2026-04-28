@@ -455,27 +455,63 @@ function renderPathList(paths, type) {
   `</div>`;
 }
 
+function renderDomainList(domains, type) {
+  if (!domains || domains.length === 0) {
+    return `<div class="path-list" id="${type}Domains"><div style="color:var(--muted);font-size:0.78rem;padding:4px 0;">No domains</div></div>`;
+  }
+  return `<div class="path-list" id="${type}Domains">` +
+    domains.map((d, i) => `
+      <div class="path-item">
+        <code>${escapeHtml(d)}</code>
+        <button class="path-remove" onclick="removeDomain('${type}', ${i})">Remove</button>
+      </div>
+    `).join('') +
+  `</div>`;
+}
+
 window._fsConfig = { allowed_paths: [], denied_paths: [] };
+window._webFetchConfig = {
+  max_depth: 1,
+  confirm_domains: true,
+  allowed_domains: [],
+  blocked_domains: [],
+  timeout_secs: 10,
+  max_size_mb: 5,
+  respect_robots_txt: true,
+  rate_limit_ms: 1000
+};
 
 async function renderSettings() {
   try {
-    const [aboutRes, permsRes, fsRes, toolsRes] = await Promise.all([
+    const [aboutRes, permsRes, fsRes, toolsRes, webRes] = await Promise.all([
       fetch(`${API_BASE}/api/about`),
       fetch(`${API_BASE}/api/permissions`),
       fetch(`${API_BASE}/api/fs/config`),
       fetch(`${API_BASE}/api/tools`),
+      fetch(`${API_BASE}/api/web/config`),
     ]);
     const about = await aboutRes.json();
     const permsData = await permsRes.json();
     const perms = permsData.permissions || [];
     const fs = await fsRes.json();
     const toolsData = await toolsRes.json();
+    const web = await webRes.json();
     window._plugins = toolsData.tools || [];
     window._fsConfig = {
       default_policy: fs.default_policy || 'deny',
       allowed_paths: fs.allowed_paths || [],
       denied_paths: fs.denied_paths || [],
       max_file_size: fs.max_file_size || 10485760
+    };
+    window._webFetchConfig = {
+      max_depth: web.max_depth ?? 1,
+      confirm_domains: web.confirm_domains ?? true,
+      allowed_domains: web.allowed_domains || [],
+      blocked_domains: web.blocked_domains || [],
+      timeout_secs: web.timeout_secs ?? 10,
+      max_size_mb: web.max_size_mb ?? 5,
+      respect_robots_txt: web.respect_robots_txt ?? true,
+      rate_limit_ms: web.rate_limit_ms ?? 1000
     };
 
     let permsHtml = '';
@@ -581,6 +617,46 @@ async function renderSettings() {
           </div>
 
           <div class="fs-save-msg" id="fsSaveMsg"></div>
+        </div>
+      </div>
+
+      <div class="settings-expandable" id="webFetchSection">
+        <div class="settings-expandable-header" onclick="toggleSettingsExpandable('webFetchSection')">
+          <span>Web Fetch</span>
+          <span class="arrow">&#9654;</span>
+        </div>
+        <div class="settings-expandable-body">
+          <div class="fs-control">
+            <label>Max depth</label>
+            <input type="number" id="webMaxDepth" value="${window._webFetchConfig.max_depth}" min="1" max="10" step="1" onchange="updateWebFetchMaxDepth(this.value)" />
+          </div>
+          <div class="fs-control">
+            <label>Timeout (seconds)</label>
+            <input type="number" id="webTimeout" value="${window._webFetchConfig.timeout_secs}" min="1" max="120" step="1" onchange="updateWebFetchTimeout(this.value)" />
+          </div>
+          <div class="fs-control">
+            <label>Max size (MB)</label>
+            <input type="number" id="webMaxSize" value="${window._webFetchConfig.max_size_mb}" min="1" max="100" step="1" onchange="updateWebFetchMaxSize(this.value)" />
+          </div>
+          <div class="fs-control">
+            <label><input type="checkbox" id="webConfirmDomains" ${window._webFetchConfig.confirm_domains ? 'checked' : ''} onchange="toggleWebFetchConfirm()" /> Confirm unknown domains</label>
+          </div>
+          <div class="fs-control">
+            <label><input type="checkbox" id="webRespectRobots" ${window._webFetchConfig.respect_robots_txt ? 'checked' : ''} onchange="toggleWebFetchRobots()" /> Respect robots.txt</label>
+          </div>
+          <div style="font-size:0.8rem;color:var(--text);margin-bottom:4px;">Allowed domains</div>
+          ${renderDomainList(window._webFetchConfig.allowed_domains, 'allowed')}
+          <div class="path-add">
+            <input type="text" id="allowedDomainInput" placeholder="e.g. github.com" />
+            <button onclick="addDomain('allowed')">Add</button>
+          </div>
+          <div style="font-size:0.8rem;color:var(--text);margin:12px 0 4px;">Blocked domains</div>
+          ${renderDomainList(window._webFetchConfig.blocked_domains, 'blocked')}
+          <div class="path-add">
+            <input type="text" id="blockedDomainInput" placeholder="e.g. evil.com" />
+            <button onclick="addDomain('blocked')">Add</button>
+          </div>
+          <div class="fs-save-msg" id="webFetchSaveMsg"></div>
         </div>
       </div>
 
@@ -770,6 +846,118 @@ async function saveAiName() {
     const msg = document.getElementById('aiNameSaveMsg');
     if (msg) msg.textContent = 'Save failed: ' + e.message;
   }
+}
+
+async function updateWebFetchMaxDepth(val) {
+  const num = parseInt(val, 10);
+  if (isNaN(num) || num < 1 || num > 10) return;
+  window._webFetchConfig.max_depth = num;
+  await saveWebFetchConfig();
+}
+
+async function updateWebFetchTimeout(val) {
+  const num = parseInt(val, 10);
+  if (isNaN(num) || num < 1 || num > 120) return;
+  window._webFetchConfig.timeout_secs = num;
+  await saveWebFetchConfig();
+}
+
+async function updateWebFetchMaxSize(val) {
+  const num = parseInt(val, 10);
+  if (isNaN(num) || num < 1 || num > 100) return;
+  window._webFetchConfig.max_size_mb = num;
+  await saveWebFetchConfig();
+}
+
+async function toggleWebFetchConfirm() {
+  const cb = document.getElementById('webConfirmDomains');
+  if (cb) window._webFetchConfig.confirm_domains = cb.checked;
+  await saveWebFetchConfig();
+}
+
+async function toggleWebFetchRobots() {
+  const cb = document.getElementById('webRespectRobots');
+  if (cb) window._webFetchConfig.respect_robots_txt = cb.checked;
+  await saveWebFetchConfig();
+}
+
+async function addDomain(type) {
+  const input = document.getElementById(type + 'DomainInput');
+  if (!input) return;
+  const val = input.value.trim();
+  if (!val) return;
+  if (type === 'allowed') {
+    if (!window._webFetchConfig.allowed_domains.includes(val)) window._webFetchConfig.allowed_domains.push(val);
+  } else {
+    if (!window._webFetchConfig.blocked_domains.includes(val)) window._webFetchConfig.blocked_domains.push(val);
+  }
+  await saveWebFetchConfig();
+  refreshWebFetchSection();
+}
+
+async function removeDomain(type, index) {
+  if (type === 'allowed') {
+    window._webFetchConfig.allowed_domains.splice(index, 1);
+  } else {
+    window._webFetchConfig.blocked_domains.splice(index, 1);
+  }
+  await saveWebFetchConfig();
+  refreshWebFetchSection();
+}
+
+async function saveWebFetchConfig() {
+  try {
+    const res = await fetch(`${API_BASE}/api/web/config`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(window._webFetchConfig)
+    });
+    const data = await res.json();
+    const msg = document.getElementById('webFetchSaveMsg');
+    if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
+    if (data.ok) setTimeout(() => { const m = document.getElementById('webFetchSaveMsg'); if (m) m.textContent = ''; }, 2000);
+  } catch(e) {
+    const msg = document.getElementById('webFetchSaveMsg');
+    if (msg) msg.textContent = 'Save failed: ' + e.message;
+  }
+}
+
+function refreshWebFetchSection() {
+  const body = document.querySelector('#webFetchSection .settings-expandable-body');
+  if (!body) return;
+  body.innerHTML = `
+    <div class="fs-control">
+      <label>Max depth</label>
+      <input type="number" id="webMaxDepth" value="${window._webFetchConfig.max_depth}" min="1" max="10" step="1" onchange="updateWebFetchMaxDepth(this.value)" />
+    </div>
+    <div class="fs-control">
+      <label>Timeout (seconds)</label>
+      <input type="number" id="webTimeout" value="${window._webFetchConfig.timeout_secs}" min="1" max="120" step="1" onchange="updateWebFetchTimeout(this.value)" />
+    </div>
+    <div class="fs-control">
+      <label>Max size (MB)</label>
+      <input type="number" id="webMaxSize" value="${window._webFetchConfig.max_size_mb}" min="1" max="100" step="1" onchange="updateWebFetchMaxSize(this.value)" />
+    </div>
+    <div class="fs-control">
+      <label><input type="checkbox" id="webConfirmDomains" ${window._webFetchConfig.confirm_domains ? 'checked' : ''} onchange="toggleWebFetchConfirm()" /> Confirm unknown domains</label>
+    </div>
+    <div class="fs-control">
+      <label><input type="checkbox" id="webRespectRobots" ${window._webFetchConfig.respect_robots_txt ? 'checked' : ''} onchange="toggleWebFetchRobots()" /> Respect robots.txt</label>
+    </div>
+    <div style="font-size:0.8rem;color:var(--text);margin-bottom:4px;">Allowed domains</div>
+    ${renderDomainList(window._webFetchConfig.allowed_domains, 'allowed')}
+    <div class="path-add">
+      <input type="text" id="allowedDomainInput" placeholder="e.g. github.com" />
+      <button onclick="addDomain('allowed')">Add</button>
+    </div>
+    <div style="font-size:0.8rem;color:var(--text);margin:12px 0 4px;">Blocked domains</div>
+    ${renderDomainList(window._webFetchConfig.blocked_domains, 'blocked')}
+    <div class="path-add">
+      <input type="text" id="blockedDomainInput" placeholder="e.g. evil.com" />
+      <button onclick="addDomain('blocked')">Add</button>
+    </div>
+    <div class="fs-save-msg" id="webFetchSaveMsg"></div>
+  `;
 }
 
 function toggleSettingsExpandable(id) {

@@ -6,9 +6,13 @@ use crate::fs::FileSystemService;
 pub mod fs_tools;
 pub mod config_tool;
 pub mod mindmap_tool;
+pub mod fetch_tool;
+pub mod remote_mindmap_tool;
+pub mod web_scrape_tool;
 
 pub struct ToolContext<'a> {
     pub fs: &'a FileSystemService,
+    pub web_fetch: &'a crate::WebFetchConfig,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

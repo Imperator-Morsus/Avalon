@@ -276,6 +276,7 @@ pub struct AppConfig {
     api_base: String,
     pub active_tools: Vec<String>,
     pub ai_name: String,
+    pub web_fetch: WebFetchConfig,
 }
 
 impl AppConfig {
@@ -294,12 +295,66 @@ impl AppConfig {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| "Avalon".to_string());
+        let web_fetch = WebFetchConfig::load();
         AppConfig {
             current_model,
             api_base: env::var("AVALON_MODEL_API_BASE").unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
             active_tools,
             ai_name,
+            web_fetch,
         }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Web Fetch Config
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct WebFetchConfig {
+    pub max_depth: u32,
+    pub confirm_domains: bool,
+    pub allowed_domains: Vec<String>,
+    pub blocked_domains: Vec<String>,
+    pub timeout_secs: u64,
+    pub max_size_mb: u32,
+    pub respect_robots_txt: bool,
+    pub rate_limit_ms: u64,
+}
+
+impl Default for WebFetchConfig {
+    fn default() -> Self {
+        WebFetchConfig {
+            max_depth: 1,
+            confirm_domains: true,
+            allowed_domains: vec![
+                "github.com".to_string(),
+                "raw.githubusercontent.com".to_string(),
+                "gist.github.com".to_string(),
+                "api.github.com".to_string(),
+            ],
+            blocked_domains: vec![],
+            timeout_secs: 10,
+            max_size_mb: 5,
+            respect_robots_txt: true,
+            rate_limit_ms: 1000,
+        }
+    }
+}
+
+impl WebFetchConfig {
+    pub fn load() -> Self {
+        let persisted = ConfigStore::load();
+        persisted.get("web_fetch")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let mut persisted = ConfigStore::load();
+        persisted.insert("web_fetch".to_string(), json!(self));
+        ConfigStore::save(&persisted);
+        Ok(())
     }
 }
 
@@ -963,7 +1018,7 @@ async fn chat_handler(
             }
             match registry.get(&call.name) {
                 Some(tool) => {
-                    match tool.execute(call.input.clone(), &tools::ToolContext { fs: &fs_svc }).await {
+                    match tool.execute(call.input.clone(), &tools::ToolContext { fs: &fs_svc, web_fetch: &cfg.web_fetch }).await {
                         Ok(result) => {
                             debug_log.lock().unwrap().push("tool_call", json!({
                                 "tool": call.name,
@@ -1264,6 +1319,23 @@ async fn fs_config_post(
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
+async fn web_config_get(config: web::Data<Mutex<AppConfig>>) -> HttpResponse {
+    let cfg = config.lock().unwrap();
+    HttpResponse::Ok().json(&cfg.web_fetch)
+}
+
+async fn web_config_post(
+    body: web::Json<WebFetchConfig>,
+    config: web::Data<Mutex<AppConfig>>,
+) -> HttpResponse {
+    let mut cfg = config.lock().unwrap();
+    cfg.web_fetch = body.into_inner();
+    if let Err(e) = cfg.web_fetch.save() {
+        return HttpResponse::InternalServerError().json(json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(json!({ "ok": true }))
+}
+
 async fn inference_handler(
     req: web::Json<InferenceRequest>,
     model_service: web::Data<Box<dyn ModelInferenceService>>,
@@ -1313,6 +1385,9 @@ async fn main() -> std::io::Result<()> {
     registry.register(Box::new(tools::fs_tools::DeleteFileTool));
     registry.register(Box::new(tools::config_tool::GetFsConfigTool));
     registry.register(Box::new(tools::mindmap_tool::MindMapTool));
+    registry.register(Box::new(tools::fetch_tool::FetchUrlTool));
+    registry.register(Box::new(tools::remote_mindmap_tool::RemoteMindMapTool));
+    registry.register(Box::new(tools::web_scrape_tool::WebScrapeTool));
 
     let all_tool_names: Vec<String> = registry.names().iter().map(|s| s.to_string()).collect();
     let mut config = AppConfig::new();
@@ -1334,7 +1409,9 @@ async fn main() -> std::io::Result<()> {
     let active_tools_set: std::collections::HashSet<String> = config.active_tools.iter().cloned().collect();
     let active_tools_list: Vec<&str> = all_tool_names.iter().filter(|name| active_tools_set.contains(*name)).map(|s| s.as_str()).collect();
     let tools_list = active_tools_list.join(", ");
-    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
+    let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nUse fetch_url to download content from a public URL. Supports text and images (returned as base64). Respects domain allow-lists, size limits, and timeouts configured in Settings > Web Fetch. Only activate this tool if the user explicitly asks you to read a remote file or image.\n\nUse remote_mindmap to download an entire public GitHub repository as a zip, build a structural graph from it, merge it with the local mindmap, then delete the temporary download. Max 25 MB. This is useful for comparing your local project with an open-source dependency or reference implementation.
+
+Use web_scrape to recursively scrape a website starting from a URL, extracting text and image references up to the configured max depth. Respects robots.txt, rate limits, and domain restrictions.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
 
     let model_service: Box<dyn ModelInferenceService> = match HttpModelService::new() {
         Ok(mut svc) => {
@@ -1417,6 +1494,11 @@ async fn main() -> std::io::Result<()> {
                 web::resource("/api/fs/config")
                     .route(web::get().to(fs_config_get))
                     .route(web::post().to(fs_config_post))
+            )
+            .service(
+                web::resource("/api/web/config")
+                    .route(web::get().to(web_config_get))
+                    .route(web::post().to(web_config_post))
             )
     })
     .bind("127.0.0.1:8080")?

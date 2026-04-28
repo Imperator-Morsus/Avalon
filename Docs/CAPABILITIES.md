@@ -38,7 +38,7 @@ Tools are now **plugins**. They implement the `Tool` trait, register in a `ToolR
 1. Implementing `Tool` in `src/tools/<name>.rs`
 2. Calling `registry.register(Box::new(MyTool))` in `main.rs`
 
-#### Default Tools
+#### Core Tools (always active)
 
 | Tool | Description | Arguments |
 |------|-------------|-----------|
@@ -47,7 +47,15 @@ Tools are now **plugins**. They implement the `Tool` trait, register in a `ToolR
 | `list_dir` | Lists files and directories | `{ path: string }` |
 | `delete_file` | Deletes a file or directory | `{ path: string }` |
 | `get_fs_config` | Reads the file system limiter config | `{}` |
+
+#### Optional Plugins
+
+| Tool | Description | Arguments |
+|------|-------------|-----------|
 | `mindmap` | Scans allowed paths and builds a graph of files and their relationships | `{}` |
+| `fetch_url` | Downloads content from any public URL. Supports text, images (base64), and PDFs (text extracted). Respects domain lists, size limits, and timeouts from Web Fetch config. | `{ url: string }` |
+| `remote_mindmap` | Downloads a public GitHub repo as a zip, builds a mind map, merges it with the local graph, then deletes the temp download. Max 25 MB. | `{ url: string }` |
+| `web_scrape` | Recursively scrapes a website starting from a URL. Extracts text and image references, follows links up to max depth. Respects robots.txt, rate limits, and domain restrictions. | `{ url: string, max_depth?: number }` |
 
 Tool calls are embedded in AI responses as XML:
 ```xml
@@ -135,6 +143,7 @@ Collapsible sections in the frontend:
 - **Active Session Permissions** — revoke granted tools
 - **About Avalon** — version, description, build info
 - **File System Limiter** — default policy, max file size (MB), allowed/denied path lists
+- **Web Fetch** — max depth, confirm unknown domains, timeout, max size, respect robots.txt, allowed/blocked domain lists
 - **Plugins** — activate/deactivate tools, save changes
 
 Paths can be added/removed and are saved to `.avalon_fs.json` immediately.
@@ -257,11 +266,62 @@ Tools can be activated or deactivated per-session:
 | GET/POST | `/api/ai_name` | Get/set AI assistant name |
 | GET | `/api/mindmap` | Get the codebase graph |
 | GET/POST | `/api/fs/config` | Get/set file system limiter config |
+| GET/POST | `/api/web/config` | Get/set web fetch config |
 | POST | `/api/fs/read` | Read a file |
 | POST | `/api/fs/write` | Write a file |
 | POST | `/api/fs/list` | List a directory |
 | POST | `/api/fs/delete` | Delete a file/directory |
 | POST | `/v1/infer` | Legacy inference endpoint |
+
+---
+
+## Web Fetch
+
+### Config
+
+The Web Fetch config is stored in `.avalon_state.json` under the `web_fetch` key:
+
+```json
+{
+  "max_depth": 1,
+  "confirm_domains": true,
+  "allowed_domains": ["github.com", "raw.githubusercontent.com", "gist.github.com", "api.github.com"],
+  "blocked_domains": [],
+  "timeout_secs": 10,
+  "max_size_mb": 5,
+  "respect_robots_txt": true,
+  "rate_limit_ms": 1000
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `max_depth` | How many levels deep `web_scrape` follows links (1–10) |
+| `confirm_domains` | If true, unknown domains require explicit approval via the allowed list |
+| `allowed_domains` | Domains that are always permitted |
+| `blocked_domains` | Domains that are always denied |
+| `timeout_secs` | Request timeout in seconds (1–120) |
+| `max_size_mb` | Max response size in megabytes (1–100) |
+| `respect_robots_txt` | Whether `web_scrape` respects `robots.txt` rules |
+| `rate_limit_ms` | Minimum milliseconds between requests to the same domain |
+
+### Security Model
+
+Layered protections enforced in the tool layer:
+
+| Layer | Implementation |
+|-------|----------------|
+| URL scheme | Block `file://`, `javascript:`, `data:`, `ftp://` |
+| SSRF | Block private IPs (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, etc.) |
+| DNS rebind | Resolve hostname, check IP before request |
+| Domain gate | Allow-list + block-list + confirmation dialog |
+| Content | Content-type whitelist: `text/*`, `image/*`, `application/json`, `application/xml` |
+| HTML | Sanitize: remove scripts, styles, iframes, event handlers |
+| Size | Enforce `max_size_mb` per response |
+| Timeout | Enforce `timeout_secs` per request |
+| Rate | Per-domain cooldown (`rate_limit_ms`) |
+| Robots | Fetch and respect `robots.txt` |
+| No execution | Never run downloaded content; only parse as text/image |
 
 ---
 
@@ -310,10 +370,13 @@ The tool immediately appears in:
 | `src/tools/fs_tools.rs` | File operation tool plugins |
 | `src/tools/config_tool.rs` | Config reading tool plugin |
 | `src/tools/mindmap_tool.rs` | Mind map building tool plugin |
+| `src/tools/fetch_tool.rs` | URL fetching tool plugin |
+| `src/tools/remote_mindmap_tool.rs` | GitHub repo download and mindmap merge plugin |
+| `src/tools/web_scrape_tool.rs` | Recursive web scraping plugin |
 | `client/main.js` | Electron bootstrap, backend lifecycle |
 | `client/ui/app.js` | Frontend app logic, SSE, settings, permissions, mind map viewer |
 | `client/ui/style.css` | Frontend styling |
 | `client/ui/index.html` | Frontend markup |
 | `.avalon_fs.json` | Persistent file system limiter rules |
-| `.avalon_state.json` | Persistent app state (current model, active tools, AI name) |
+| `.avalon_state.json` | Persistent app state (current model, active tools, AI name, web fetch config) |
 | `logs/avalon-debug-*.md` | Saved debug logs |

@@ -55,8 +55,19 @@ impl MindMapService {
     /// Build a mind map from a list of allowed paths.
     /// Only scans files the limiter allows.
     pub fn build(&mut self, allowed_paths: &[String], max_depth: usize) {
-        self.graph.nodes.clear();
-        self.graph.edges.clear();
+        self.build_with_prefix(allowed_paths, max_depth, None);
+    }
+
+    pub fn build_with_prefix(
+        &mut self,
+        allowed_paths: &[String],
+        max_depth: usize,
+        prefix: Option<&str>,
+    ) {
+        if prefix.is_none() {
+            self.graph.nodes.clear();
+            self.graph.edges.clear();
+        }
 
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: Vec<(String, usize)> = Vec::new();
@@ -165,6 +176,25 @@ impl MindMapService {
         if !self.graph.nodes.is_empty() {
             self.graph.root = self.graph.nodes[0].id.clone();
         }
+    }
+
+    pub fn merge(&mut self, other: &MindMap) {
+        for node in &other.nodes {
+            if !self.graph.nodes.iter().any(|n| n.id == node.id) {
+                self.graph.nodes.push(node.clone());
+            }
+        }
+        for edge in &other.edges {
+            if !self.graph.edges.iter().any(|e| {
+                e.source == edge.source && e.target == edge.target && e.relation == edge.relation
+            }) {
+                self.graph.edges.push(edge.clone());
+            }
+        }
+    }
+
+    pub fn set_root(&mut self, root: &str) {
+        self.graph.root = root.to_string();
     }
 
     fn add_node(&mut self, id: &str, label: String, node_type: &str) {

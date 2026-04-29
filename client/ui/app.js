@@ -1285,7 +1285,8 @@ async function createAgent() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name, role, display_name: displayName, description, system_prompt: systemPrompt, allowed_tools: allowedTools })
     });
-    const data = await res.json();
+    const text = await res.text();
+    const data = text ? JSON.parse(text) : {};
     if (data.id) {
       renderAgentPanel();
       addDebugLine(`[${ts()}] AGENT CREATED: ${name}`, 'info');

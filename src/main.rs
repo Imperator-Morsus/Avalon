@@ -2000,6 +2000,9 @@ async fn main() -> std::io::Result<()> {
     let vault_service = Arc::new(Mutex::new(vault::VaultService::new(vault_db.clone())));
     let vision_service = Arc::new(Mutex::new(vision::VisionService::new(vault_db.clone())));
     let agent_registry = Arc::new(Mutex::new(agents::AgentRegistry::new(vault_db.clone())));
+    let vault_service_data = web::Data::new(vault_service.clone());
+    let vision_service_data = web::Data::new(vision_service.clone());
+    let agent_registry_data = web::Data::new(agent_registry.clone());
 
     // Seed built-in agents on first startup (idempotent)
     if let Err(e) = agent_registry.lock().unwrap().seed_builtin_agents() {
@@ -2078,6 +2081,13 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
 
         App::new()
             .wrap(cors)
+            .app_data(web::JsonConfig::default().error_handler(|err, _req| {
+                let msg = format!("{}", err);
+                actix_web::error::InternalError::from_response(
+                    err,
+                    HttpResponse::BadRequest().json(json!({"error": msg})),
+                ).into()
+            }))
             .app_data(model_service_data.clone())
             .app_data(security_data.clone())
             .app_data(audit_log_data.clone())
@@ -2087,9 +2097,9 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             .app_data(registry_data.clone())
             .app_data(mindmap_data.clone())
             .app_data(vault_db_data.clone())
-            .app_data(vault_service.clone())
-            .app_data(vision_service.clone())
-            .app_data(agent_registry.clone())
+            .app_data(vault_service_data.clone())
+            .app_data(vision_service_data.clone())
+            .app_data(agent_registry_data.clone())
             // Legacy endpoint
             .service(web::resource("/v1/infer").route(web::post().to(inference_handler)))
             // GUI endpoints

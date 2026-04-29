@@ -143,7 +143,7 @@ See [Docs/SECURITY_PROTOCOL.md](Docs/SECURITY_PROTOCOL.md) for full details.
 ## Quick Start
 
 ```bash
-git clone https://github.com/MattRidge/Avalon.git
+git clone https://github.com/Imperator-Morsus/Avalon.git
 cd Avalon
 ```
 

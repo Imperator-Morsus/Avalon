@@ -99,7 +99,7 @@ ffprobe -version
 ### Step 1: Clone the Repository
 
 ```bash
-git clone https://github.com/MattRidge/Avalon.git
+git clone https://github.com/Imperator-Morsus/Avalon.git
 cd Avalon
 ```
 

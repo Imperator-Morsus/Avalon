@@ -210,10 +210,17 @@ impl Tool for WebScrapeTool {
 
             pages.push(PageData {
                 url: url.clone(),
-                title,
-                text,
+                title: title.clone(),
+                text: text.clone(),
                 images,
             });
+
+            // Auto-ingest scraped page text into vault
+            let _ = ctx
+                .vault
+                .lock()
+                .unwrap()
+                .ingest_text(&url, Some(&title), &text, "text");
 
             if depth < max_depth {
                 let links = extract_links(&html, &parsed);

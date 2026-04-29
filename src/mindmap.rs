@@ -35,6 +35,7 @@ pub struct MindMap {
 
 pub struct MindMapService {
     graph: MindMap,
+    remote_graph: Option<MindMap>,
 }
 
 impl MindMapService {
@@ -45,11 +46,33 @@ impl MindMapService {
                 edges: Vec::new(),
                 root: String::new(),
             },
+            remote_graph: None,
         }
     }
 
     pub fn graph(&self) -> &MindMap {
         &self.graph
+    }
+
+    pub fn remote_graph(&self) -> Option<&MindMap> {
+        self.remote_graph.as_ref()
+    }
+
+    pub fn set_remote_graph(&mut self, remote: MindMap) {
+        self.remote_graph = Some(remote);
+    }
+
+    pub fn clear_remote_graph(&mut self) {
+        self.remote_graph = None;
+    }
+
+    pub fn merge_remote(&mut self) -> bool {
+        if let Some(remote) = self.remote_graph.take() {
+            self.merge(&remote);
+            true
+        } else {
+            false
+        }
     }
 
     /// Build a mind map from a list of allowed paths.
@@ -203,6 +226,23 @@ impl MindMapService {
 
     pub fn set_root(&mut self, root: &str) {
         self.graph.root = root.to_string();
+    }
+
+    /// Return a truncated copy with at most `max_nodes` nodes and only edges between kept nodes.
+    pub fn truncated(&self, max_nodes: usize) -> MindMap {
+        let mut nodes = self.graph.nodes.clone();
+        nodes.truncate(max_nodes);
+        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let edges: Vec<MindMapEdge> = self.graph.edges
+            .iter()
+            .filter(|e| kept.contains(&e.source) && kept.contains(&e.target))
+            .cloned()
+            .collect();
+        MindMap {
+            nodes,
+            edges,
+            root: self.graph.root.clone(),
+        }
     }
 
     fn add_node(&mut self, id: &str, label: String, node_type: &str) {

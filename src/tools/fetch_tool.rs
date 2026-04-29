@@ -64,17 +64,19 @@ impl Tool for FetchUrlTool {
         }
 
         // SSRF protection: block private IPs
-        if let Some(ip_str) = parsed.host_str() {
-            if let Ok(ip) = IpAddr::from_str(ip_str) {
-                if is_private_ip(ip) {
-                    return Err("Private IP addresses are not allowed.".to_string());
+        if ctx.security.block_private_ips {
+            if let Some(ip_str) = parsed.host_str() {
+                if let Ok(ip) = IpAddr::from_str(ip_str) {
+                    if is_private_ip(ip) {
+                        return Err("Private IP addresses are not allowed.".to_string());
+                    }
                 }
             }
-        }
-        if let Ok(addrs) = tokio::net::lookup_host(format!("{}:{}", host, parsed.port().unwrap_or(80))).await {
-            for addr in addrs {
-                if is_private_ip(addr.ip()) {
-                    return Err("Private IP addresses are not allowed.".to_string());
+            if let Ok(addrs) = tokio::net::lookup_host(format!("{}:{}", host, parsed.port().unwrap_or(80))).await {
+                for addr in addrs {
+                    if is_private_ip(addr.ip()) {
+                        return Err("Private IP addresses are not allowed.".to_string());
+                    }
                 }
             }
         }
@@ -158,17 +160,26 @@ impl Tool for FetchUrlTool {
         }
 
         if content_type.contains("application/pdf") {
-            return extract_pdf_text(&bytes, url);
+            let result = extract_pdf_text(&bytes, url)?;
+            // Auto-ingest PDF text into vault
+            if let Ok(content) = result.get("content").and_then(|v| v.as_str()).ok_or("") {
+                let _ = ctx.vault.lock().unwrap().ingest_text(url, None, content, "pdf");
+            }
+            return Ok(result);
         }
 
         let text = String::from_utf8(bytes.to_vec())
             .map_err(|_| "Response is not valid UTF-8 text.".to_string())?;
 
-        let text = if content_type.contains("html") {
+        let text = if content_type.contains("html") && ctx.security.enforce_html_sanitize {
             sanitize_html(&text)
         } else {
             text
         };
+
+        // Auto-ingest fetched text into vault
+        let content_type_label = if content_type.contains("html") { "html" } else { "text" };
+        let _ = ctx.vault.lock().unwrap().ingest_text(url, None, &text, content_type_label);
 
         Ok(serde_json::json!({
             "url": url,

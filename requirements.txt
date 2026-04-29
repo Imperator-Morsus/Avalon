@@ -10,6 +10,7 @@ This file lists the dependencies required to build and run Avalon.
 | Node.js | 22.x LTS | Frontend runtime | https://nodejs.org |
 | npm | 10.x+ | Frontend package manager | Included with Node.js |
 | Ollama | Latest | Local LLM inference (optional) | https://ollama.com |
+| ffmpeg | Latest | Video analysis -- ffprobe and ffmpeg binaries (optional) | https://ffmpeg.org |
 
 ## Rust Crates
 
@@ -33,6 +34,7 @@ hex = "0.4"
 flate2 = "1"
 tar = "0.4"
 chrono = { version = "0.4", features = ["serde"] }
+rusqlite = { version = "0.33", features = ["bundled"] }
 ```
 
 Install them automatically with:

@@ -26,6 +26,7 @@ The backend can connect to any OpenAI-compatible API or Ollama:
 - **Select model**: `/api/model` (GET/POST) — persists to `.avalon_state.json`
 - **Preload model**: `/api/preload?model=` — keeps a model warm in Ollama memory
 - **Chat**: `/api/chat?message=` — primary SSE streaming endpoint for conversation
+- **Multi-round execution** — up to 3 rounds of tool calls per user message. If the AI's first response contains tool calls, Avalon executes them, appends the results, and sends the updated context back to the model for another inference turn. This allows the AI to chain reads, analysis, and synthesis without requiring the user to prompt each step.
 
 Environment variables:
 - `AVALON_MODEL_NAME` — default model
@@ -56,6 +57,14 @@ Tools are now **plugins**. They implement the `Tool` trait, register in a `ToolR
 | `fetch_url` | Downloads content from any public URL. Supports text, images (base64), and PDFs (text extracted). Respects domain lists, size limits, and timeouts from Web Fetch config. | `{ url: string }` |
 | `remote_mindmap` | Downloads a public GitHub repo as a zip, builds a mind map, merges it with the local graph, then deletes the temp download. Max 25 MB. | `{ url: string }` |
 | `web_scrape` | Recursively scrapes a website starting from a URL. Extracts text and image references, follows links up to max depth. Respects robots.txt, rate limits, and domain restrictions. | `{ url: string, max_depth?: number }` |
+| `analyze_video` | Analyzes a local video file. Extracts metadata, keyframes as base64 images, and embedded subtitles. Requires ffmpeg. | `{ path: string, interval_seconds?: number, max_frames?: number }` |
+| `vault_search` | Queries the MindVault full-text index for ingested documents, PDFs, or web-scraped text | `{ query: string, limit?: number }` |
+| `vault_read` | Retrieves the full content of a MindVault document by ID | `{ id: number }` |
+| `vision_search` | Queries the VisionVault for images by description or tags | `{ query: string, limit?: number }` |
+| `vision_read` | Retrieves metadata for a VisionVault image by ID | `{ id: number }` |
+| `dispatch_agent` | Dispatches an agent to perform a task (returns dispatch ID) | `{ agent_name: string, task: string }` |
+| `board_post` | Posts a message to an agent dispatch board | `{ dispatch_id: number, author: string, content: string, channel?: string }` |
+| `board_read` | Reads messages from an agent dispatch board | `{ dispatch_id: number, channel?: string, since?: string }` |
 
 Tool calls are embedded in AI responses as XML:
 ```xml
@@ -117,11 +126,37 @@ A comprehensive debug log captures every internal event:
 Endpoints:
 - `GET /api/debug` — returns all log entries
 - `POST /api/debug/clear` — wipes the log
-- `POST /api/debug/save` — writes a Markdown debug log to `logs/avalon-debug-{timestamp}.md`
+- `POST /api/debug/save` — writes a comprehensive Markdown debug log (chat history + debug events) to `logs/debug/`
 
 The frontend polls `/api/debug` every 100ms and renders events with color coding.
 
-### 7. SSE Streaming
+### 7. Audit Logging
+
+Avalon maintains a cryptographically verifiable audit trail for legal compliance and chain-of-custody:
+
+**Features**
+- **SHA-256 hash chains** — each entry links to the previous via `prev_hash`
+- **Merkle roots** — per-session integrity root computed from all entries
+- **Append-only** — entries are written to hot storage immediately and never modified
+- **Session manifests** — signed manifest written at session end with entry count, Merkle root, and closing hash
+- **Tiered storage**:
+  - **Hot** — active session NDJSON in `logs/audit/active/`
+  - **Warm** — daily tar.gz archives in `logs/audit/warm/` (configurable)
+  - **Cold** — long-term archive in `archive/audit/` (configurable)
+- **WORM behavior** — warm archives are set read-only after creation
+- **Verification** — `/api/audit/verify/{session}` checks hash chain integrity and reports any breaks
+- **Export** — `/api/audit/export/{session}` produces a court-admissible chain-of-custody document
+- **Cleanup** — `POST /api/audit/cleanup` archives old sessions and verifies integrity
+
+**Config**
+- `GET/POST /api/audit/config` — warm and cold tier toggles (`warm_enabled`, `cold_enabled`)
+
+**Storage format**
+```ndjson
+{"seq":1,"session_id":"sess-...","timestamp":"...","prev_hash":"000...","entry_hash":"abc...","entry_type":"chat","actor":"user","data":{...}}
+```
+
+### 8. SSE Streaming
 
 The chat endpoint streams events to the frontend in real time:
 
@@ -135,7 +170,7 @@ The chat endpoint streams events to the frontend in real time:
 | `error` | Backend or connection error |
 | `done` | Turn completed, includes iteration count |
 
-### 8. Settings Panel
+### 9. Settings Panel
 
 Collapsible sections in the frontend:
 - **Model** — current model display
@@ -144,17 +179,25 @@ Collapsible sections in the frontend:
 - **About Avalon** — version, description, build info
 - **File System Limiter** — default policy, max file size (MB), allowed/denied path lists
 - **Web Fetch** — max depth, confirm unknown domains, timeout, max size, respect robots.txt, allowed/blocked domain lists
+- **Security** — toggle private IP blocking, HTML sanitization, write/delete permission requirements
+- **Audit Log** — enable/disable warm and cold tier archiving
 - **Plugins** — activate/deactivate tools, save changes
+
+**Chat reset** — Click the X button in the header to clear chat history without restarting.
+
+**Right-click spell check** — Right-click any word in a chat message to open a context menu with spelling suggestions. Click a suggestion to replace the word.
 
 Paths can be added/removed and are saved to `.avalon_fs.json` immediately.
 
-### 9. Electron Lifecycle
+### 10. Electron Lifecycle
 
 The Electron app (`client/main.js`):
 - **Starts** the Rust backend automatically when the app opens
 - **Kills** the backend automatically when the app quits
 - Loads `client/ui/index.html` in a `1400x900` window
 - Supports `--dev` flag to open DevTools
+
+Desktop shortcuts (`StartAvalonDesktop.vbs`, `StartAvalon.vbs`, `CreateShortcuts.ps1`) allow launching without a terminal.
 
 ---
 
@@ -219,8 +262,50 @@ You can also trigger it manually:
 }
 ```
 
-Node types: `file`, `dir`, `symbol`
+Node types: `file`, `dir`, `symbol`, `image`
 Edge relations: `imports`, `references`, `contains`, `depends_on`
+
+### Image Nodes
+
+Image files detected in the file system (`jpg`, `jpeg`, `png`, `gif`, `webp`, `bmp`, `svg`, `ico`) are rendered as circular thumbnails in the mind map viewer. They are fetched securely via `/api/fs/image` with steganography scanning.
+
+---
+
+## Image Support & Steganography Detection
+
+Avalon can read images from the file system or the web and display them inline in chat or as thumbnails in the mind map.
+
+**Security scanning:** Before displaying any image, Avalon scans for hidden data appended after the expected EOF marker:
+
+| Format | EOF Marker | Detection |
+|--------|-----------|-----------|
+| PNG | IEND chunk (`49 45 4E 44 AE 42 60 82`) | Trailing bytes after IEND |
+| JPEG | EOI marker (`FF D9`) | Trailing bytes after EOI |
+| GIF | Trailer byte (`3B`) | Trailing bytes after trailer |
+| WebP | RIFF container size | Mismatch between declared and actual size |
+| BMP | Header size field | Mismatch between declared and actual size |
+| SVG | Closing `</svg>` tag | Embedded base64 or scripts after tag |
+
+If hidden data is found:
+- A warning is displayed to the user
+- The hidden data is **stripped** before the image is shown
+- The original file on disk is **never modified**
+
+**Endpoints:**
+- `POST /api/fs/image` — reads an image file, returns base64, MIME type, and any warnings
+
+---
+
+## Spell Check
+
+Avalon provides inline spell checking in chat messages:
+
+- **Right-click** any word in a chat message to open the context menu
+- **Suggestions** are fetched from the backend via `POST /api/spellcheck`
+- **Replace** a word by clicking a suggestion
+- **Works on** both user and assistant messages
+
+The frontend uses canvas-based word detection to identify the word under the cursor. The backend checks spelling against a dictionary and returns up to 5 suggestions.
 
 ---
 
@@ -272,6 +357,30 @@ Tools can be activated or deactivated per-session:
 | POST | `/api/fs/write` | Write a file |
 | POST | `/api/fs/list` | List a directory |
 | POST | `/api/fs/delete` | Delete a file/directory |
+| POST | `/api/fs/image` | Read an image file (returns base64 + steganography warnings) |
+| GET/POST | `/api/audit/config` | Get/set audit log config (warm/cold tier toggles) |
+| GET | `/api/audit/verify/{session}` | Verify audit chain integrity |
+| GET | `/api/audit/export/{session}` | Export chain-of-custody document |
+| POST | `/api/audit/cleanup` | Archive old sessions and verify integrity |
+| POST | `/api/spellcheck` | Check spelling and get suggestions |
+| GET/POST | `/api/security/config` | Get/set security config |
+| GET | `/api/vault/search` | Search MindVault documents |
+| GET | `/api/vault/document/{id}` | Retrieve MindVault document |
+| DELETE | `/api/vault/document/{id}` | Delete MindVault document |
+| GET | `/api/vision/search` | Search VisionVault images |
+| GET | `/api/vision/image/{id}` | Retrieve VisionVault image metadata |
+| POST | `/api/vision/confirm/{id}` | Confirm/update image description and tags |
+| DELETE | `/api/vision/image/{id}` | Delete VisionVault image record |
+| GET | `/api/agents` | List all agents |
+| POST | `/api/agents` | Create agent |
+| GET | `/api/agents/{name}` | Get agent details |
+| POST | `/api/agents/{name}` | Update agent (non-built-in only) |
+| DELETE | `/api/agents/{name}` | Delete agent (non-built-in only) |
+| POST | `/api/agents/dispatch` | Dispatch an agent |
+| GET | `/api/agents/dispatch/{id}` | Get dispatch status |
+| POST | `/api/agents/dispatch/{id}/cancel` | Cancel dispatch |
+| GET | `/api/agents/dispatch/{id}/board` | Read board posts |
+| POST | `/api/agents/dispatch/{id}/board` | Post to board |
 | POST | `/v1/infer` | Legacy inference endpoint |
 
 ### Direct Fetch (`/api/fetch`)
@@ -371,6 +480,119 @@ Layered protections enforced in the tool layer:
 
 ---
 
+## Security Config
+
+The Security config is stored in `.avalon_state.json` under the `security` key:
+
+```json
+{
+  "block_private_ips": true,
+  "enforce_html_sanitize": true,
+  "require_write_permission": true,
+  "require_delete_permission": true
+}
+```
+
+| Field | Description |
+|-------|-------------|
+| `block_private_ips` | Block requests to private IP ranges (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, etc.) |
+| `enforce_html_sanitize` | Strip scripts, styles, iframes, and event handlers from fetched HTML |
+| `require_write_permission` | Block `write_file` unless explicitly approved in Settings > Security |
+| `require_delete_permission` | Block `delete_file` unless explicitly approved in Settings > Security |
+
+**Endpoints:**
+- `GET/POST /api/security/config` — get/set security config
+
+---
+
+## MindVault
+
+Persistent document storage with full-text search. Automatically ingests files when written or fetched.
+
+### Auto-Ingest Pipeline
+
+```
+File written by tool / URL fetched / Page scraped
+    -> FileSystemService limiter (existing)
+    -> Content extraction (text/PDF to plain text)
+    -> HTML/JS stripping if markup detected
+    -> Size validation
+    -> Hash check (SHA-256 deduplication)
+    -> Commit to SQLite (FTS5 index updated)
+```
+
+### Content Types
+
+| Type | Extension | Extraction |
+|------|-----------|------------|
+| `text` | `.txt`, `.log` | Read as UTF-8, normalize whitespace |
+| `markdown` | `.md` | Read as UTF-8, normalize whitespace |
+| `code` | `.rs`, `.js`, `.ts`, `.py`, `.go`, `.java`, `.c`, `.cpp`, `.h`, `.hpp`, `.cs`, `.sh`, `.bat`, `.ps1` | Read as UTF-8, normalize whitespace |
+| `html` | `.html`, `.htm` | Strip tags, decode entities, normalize |
+| `pdf` | `.pdf` | Extract text via `lopdf` (no scripts executed) |
+
+### Sanitization
+
+- Remove null bytes and control characters (except newlines/tabs)
+- Normalize whitespace (collapse multiple spaces, trim)
+- Strip HTML scripts, styles, iframes, forms, and inline event handlers
+
+---
+
+## VisionVault
+
+Image library with searchable metadata. Automatically ingests images when read via the file system.
+
+### Auto-Ingest
+
+When `POST /api/fs/image` successfully reads an image, it is automatically ingested into VisionVault with:
+- Format detection from magic bytes
+- Dimension extraction from headers
+- SHA-256 hash for deduplication
+
+### Description Workflow
+
+1. Image is auto-ingested with `confirmed = 0`
+2. AI or user suggests a description
+3. User confirms/edits via `POST /api/vision/confirm/{id}`
+4. Description and tags are stored and FTS5-indexed
+
+### Supported Formats
+
+| Format | Magic Bytes | Dimensions From |
+|--------|-------------|-----------------|
+| PNG | `89 50 4E 47` | IHDR chunk (offset 16) |
+| JPEG | `FF D8 FF` | SOF markers |
+| GIF | `GIF87a` / `GIF89a` | Logical screen descriptor |
+| WebP | `RIFF....WEBP` | VP8 chunk |
+| BMP | `BM` | DIB header |
+
+---
+
+## Secure Agent System
+
+Agents are stored in SQLite with a strictly whitelisted tool set. They cannot escalate privileges or modify themselves.
+
+### Agent Rules
+
+| Rule | Enforcement |
+|------|-------------|
+| No shell execution | `bash`, `shell`, `exec`, `eval` are forbidden and cannot be added to `allowed_tools` |
+| No self-modification | No `create_agent`, `delete_agent`, `update_agent` tools exist |
+| Whitelist only | Agents can only use tools in their `allowed_tools` JSON array |
+| Built-in protection | Agents with `is_builtin = 1` cannot be updated or deleted |
+| Same permissions | Agent tool calls go through the same permission pipeline as user tool calls |
+
+### Agent Lifecycle
+
+1. **Create** — `POST /api/agents` with name, role, system_prompt, and allowed_tools
+2. **Dispatch** — `POST /api/agents/dispatch` or `dispatch_agent` tool creates a pending record
+3. **Execute** — Agent runs in the async event loop (not background threads), up to `max_rounds`
+4. **Board** — Agents post results to a per-dispatch message board
+5. **Memory** — Session summaries stored in `agent_memory` table
+
+---
+
 ## Extending Avalon
 
 ### Add a New Tool Plugin
@@ -419,10 +641,25 @@ The tool immediately appears in:
 | `src/tools/fetch_tool.rs` | URL fetching tool plugin |
 | `src/tools/remote_mindmap_tool.rs` | GitHub repo download and mindmap merge plugin |
 | `src/tools/web_scrape_tool.rs` | Recursive web scraping plugin |
+| `src/tools/video_tool.rs` | Video analysis plugin (metadata, frames, subtitles) |
+| `src/audit.rs` | Cryptographic audit logging, hash chains, Merkle roots, tiered storage |
+| `src/db.rs` | SQLite database layer: schema, FTS5 triggers, VaultDb operations |
+| `src/vault.rs` | MindVault document ingestion, search, retrieval |
+| `src/vision.rs` | VisionVault image ingestion, format detection, dimension extraction |
+| `src/agents.rs` | Secure Agent Registry: CRUD, dispatch, board, memory |
+| `src/agent_workers.rs` | Agent Worker extension point stub trait |
+| `src/tools/vault_search_tool.rs` | MindVault search tool |
+| `src/tools/vault_read_tool.rs` | MindVault read tool |
+| `src/tools/vision_search_tool.rs` | VisionVault search tool |
+| `src/tools/vision_read_tool.rs` | VisionVault read tool |
+| `src/tools/dispatch_agent_tool.rs` | Agent dispatch tool |
+| `src/tools/board_post_tool.rs` | Agent board post tool |
+| `src/tools/board_read_tool.rs` | Agent board read tool |
 | `client/main.js` | Electron bootstrap, backend lifecycle |
 | `client/ui/app.js` | Frontend app logic, SSE, settings, permissions, mind map viewer |
 | `client/ui/style.css` | Frontend styling |
 | `client/ui/index.html` | Frontend markup |
 | `.avalon_fs.json` | Persistent file system limiter rules |
 | `.avalon_state.json` | Persistent app state (current model, active tools, AI name, web fetch config) |
-| `logs/avalon-debug-*.md` | Saved debug logs |
+| `logs/debug/` | Saved debug logs (chat history + events) |
+| `logs/audit/active/` | Hot audit log entries (NDJSON) |

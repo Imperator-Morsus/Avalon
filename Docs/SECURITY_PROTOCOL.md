@@ -180,6 +180,42 @@ On Unix systems, closed session files are set to read-only (`0o444`). The append
 
 ---
 
-## 8. Reporting Issues
+## 8. Agent Security
+
+### 8.1 Absolute Deny-List
+
+The following tools **never exist** in Avalon's registry and **cannot be added** to any agent's `allowed_tools`:
+
+- `bash`, `shell`, `exec`, `eval` — no command execution
+- `create_agent`, `delete_agent`, `update_agent` — no agent self-modification
+
+Enforcement is at the registry level: `AgentRegistry::create_agent` and `update_agent` reject any forbidden tool.
+
+### 8.2 Agent Isolation
+
+| Guarantee | Implementation |
+|-----------|----------------|
+| Tool whitelist | `allowed_tools` JSON array stored per agent; runtime enforcement via `ToolRegistry` |
+| No self-modification | No tools exist to mutate the `agents` table |
+| Built-in protection | `is_builtin = 1` rows cannot be updated or deleted via API |
+| Same permission pipeline | Agent tool calls use identical `ToolContext` and session permission checks |
+| No background threads | Agents run in the same Tokio async runtime as chat, not OS threads |
+| Audit coverage | All agent dispatches and tool calls are logged to the audit trail |
+
+### 8.3 Vault Sanitization Pipeline
+
+All external data (files, fetches, scrapes) passes through sanitization before SQLite storage:
+
+1. **FileSystemService limiter** — path bounds check
+2. **Content extraction** — text/PDF to plain text; HTML tag stripping
+3. **Null-byte removal** — strip `\0` and control chars
+4. **Whitespace normalization** — collapse runs, trim ends
+5. **Hash deduplication** — SHA-256 prevents duplicate storage
+6. **Size validation** — enforce `max_size_mb`
+7. **FTS5 commit** — index updated via SQLite triggers
+
+---
+
+## 9. Reporting Issues
 
 Security concerns should be reported to `legal@imperatormorsus.com`.

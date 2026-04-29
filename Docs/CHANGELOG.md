@@ -89,6 +89,162 @@ A major expansion of Avalon's network capabilities, moving from hardcoded GitHub
 
 ---
 
+## 0.3.0 — 2026-04-28
+
+### Video Analysis Tool
+
+- New `analyze_video` tool (`src/tools/video_tool.rs`)
+- Extracts metadata via `ffprobe`, keyframes as base64 via `ffmpeg`, and embedded subtitle tracks
+- Configurable `interval_seconds` and `max_frames`
+- Requires `ffmpeg` installed on the host system
+
+### Security Config Settings
+
+- New `SecurityConfig` struct in `src/main.rs` stored in `.avalon_state.json` under the `security` key
+- Settings panel section with toggles:
+  - `block_private_ips` — SSRF private IP blocking
+  - `enforce_html_sanitize` — strip scripts/styles/iframes from fetched HTML
+  - `require_write_permission` — block `write_file` unless approved
+  - `require_delete_permission` — block `delete_file` unless approved
+- Endpoints: `GET/POST /api/security/config`
+- Enforced in `fetch_tool.rs`, `fs_tools.rs`, and the fetch pipeline
+
+### Spell Check
+
+- Right-click context menu on words in chat messages
+- `POST /api/spellcheck` endpoint returns suggestions
+- Canvas-based word detection under the cursor
+- Click a suggestion to replace the word inline
+
+### UI Improvements
+
+- **Chat reset button** (X icon in header) clears chat history without restarting
+- **Mindmap reset button** fixed — simulation is now non-blocking, chunked via `requestAnimationFrame`
+- **Debug save** exports comprehensive Markdown with chat history + debug log to `logs/debug/`
+- **Direct Fetch button** (down arrow) in the input bar for direct URL fetching
+
+### Launcher Scripts
+
+- `StartAvalonDesktop.vbs` — double-click Electron launcher, auto-detects release/debug build
+- `StartAvalon.vbs` — browser launcher with backend wait logic
+- `CreateShortcuts.ps1` — creates Desktop and Start Menu shortcuts for both variants
+- No PowerShell terminal required for daily use
+- Electron app auto-starts backend on launch and kills it on quit
+
+### Backend Improvements
+
+- **Multi-round tool execution** — up to 3 inference rounds per user message, allowing the AI to chain reads, analysis, and synthesis
+- **Hardened system prompt** with 5 explicit rules: ALWAYS USE TOOLS, GO DEEP, NEVER DESCRIBE CONTEXT DATA GENERICALLY, CREATE STRUCTURED REPORTS, NEVER REFUSE TO USE TOOLS
+- **Default model** changed from `llama3` to `qwen2.5-coder:32b`
+- **Mindmap capping** — limited to 80 nodes and depth 1 to prevent local model timeouts on large codebases
+- **Audit log** `save_to_file()` writes to `logs/debug/` instead of `logs/audit/`
+- **Chain-of-custody export** fixed to actually write the Markdown file to disk
+
+### Root Cleanup
+
+- Removed 15+ clutter files from `D:\Avalon\`
+- Consolidated duplicate documentation
+
+---
+
+## 0.4.0 — 2026-04-28
+
+### MindVault — Persistent Document Ingestion & Search
+
+- **SQLite + FTS5** full-text search backend (`src/db.rs`)
+  - `vault_documents` table with SHA-256 content hashing for deduplication
+  - `vault_fts` virtual table for ranked full-text search across titles and content
+  - Automatic FTS5 index maintenance via SQLite triggers
+- **VaultService** (`src/vault.rs`)
+  - `ingest_file(path)` — reads text, PDF, HTML, markdown, and code files; extracts content; sanitizes; stores
+  - `ingest_text(source, title, content, type)` — direct ingestion for fetched/scraped content
+  - `search(query, limit)` — FTS5 ranked search returning `VaultDoc` records
+  - `get(id)` / `delete(id)` — retrieve or remove documents
+  - Content sanitization: strips null bytes, control characters, normalizes whitespace
+  - PDF text extraction via `lopdf` (no scripts or embedded objects executed)
+  - HTML sanitization: strips `<script>`, `<style>`, `<iframe>`, `<form>`, event handlers
+- **Auto-ingest hooks**
+  - `write_file` tool automatically ingests written files into MindVault
+  - `fetch_url` tool automatically ingests fetched PDFs and text content
+  - `web_scrape` tool automatically ingests scraped page text
+- **New tools**
+  - `vault_search` — query the MindVault by FTS5
+  - `vault_read` — retrieve a single document by ID
+- **New endpoints**
+  - `GET /api/vault/search?q=&limit=` — search documents
+  - `GET /api/vault/document/{id}` — retrieve document
+  - `DELETE /api/vault/document/{id}` — delete document
+
+### VisionVault — Image Library with Searchable Metadata
+
+- **SQLite + FTS5** for image descriptions and tags (`src/db.rs`)
+  - `vision_images` table with format, dimensions, hash, and confirmation status
+  - `vision_fts` virtual table for searching descriptions and tags
+- **VisionService** (`src/vision.rs`)
+  - `ingest_image(path, suggested_description)` — detects format and dimensions from magic bytes, stores metadata
+  - `confirm_description(id, description, tags)` — user-reviewed description confirmation
+  - `search(query, limit)` — FTS5 search across descriptions and tags
+  - `get(id)` / `delete(id)` — retrieve or remove image records
+  - Format detection: PNG, JPEG, GIF, WebP, BMP, SVG
+  - Dimension extraction from image headers (no external libraries needed)
+- **Auto-ingest hook**
+  - `read_image` endpoint (`/api/fs/image`) automatically ingests successfully read images into VisionVault
+- **New tools**
+  - `vision_search` — query the VisionVault by description/tags
+  - `vision_read` — retrieve a single image record by ID
+- **New endpoints**
+  - `GET /api/vision/search?q=&limit=` — search images
+  - `GET /api/vision/image/{id}` — retrieve image metadata
+  - `POST /api/vision/confirm/{id}` — confirm/update description and tags
+  - `DELETE /api/vision/image/{id}` — delete image record
+
+### Secure Agent System
+
+- **AgentRegistry** (`src/agents.rs`)
+  - Agents stored in SQLite `agents` table with whitelisted `allowed_tools`
+  - Built-in agents protected from modification/deletion (`is_builtin` flag)
+  - Forbidden tools enforced at creation time: `bash`, `shell`, `exec`, `eval`, `create_agent`, `delete_agent`, `update_agent`
+  - CRUD operations: `list_agents`, `get_agent`, `create_agent`, `update_agent`, `delete_agent`
+- **Dispatch & Board**
+  - `agent_dispatches` table tracks task status (`pending`, `running`, `completed`, `failed`, `cancelled`)
+  - `agent_board` table for inter-agent messaging per dispatch
+  - `agent_memory` table for session summaries
+- **New tools**
+  - `dispatch_agent` — creates a dispatch record for an agent task
+  - `board_post` — post a message to a dispatch board
+  - `board_read` — read messages from a dispatch board
+- **New endpoints**
+  - `GET /api/agents` — list all agents
+  - `POST /api/agents` — create agent
+  - `GET /api/agents/{name}` — get agent details
+  - `POST /api/agents/{name}` — update agent (non-built-in only)
+  - `DELETE /api/agents/{name}` — delete agent (non-built-in only)
+  - `POST /api/agents/dispatch` — dispatch an agent
+  - `GET /api/agents/dispatch/{id}` — get dispatch status
+  - `POST /api/agents/dispatch/{id}/cancel` — cancel dispatch
+  - `GET /api/agents/dispatch/{id}/board` — read board posts
+  - `POST /api/agents/dispatch/{id}/board` — post to board
+
+### Agent Worker Extension Point
+
+- **Stub trait** (`src/agent_workers.rs`)
+  - `AgentWorker` trait for external processes that register as agents
+  - `WorkerRegistry` for managing loaded workers
+  - `HttpImageWorker` placeholder for future image generation integration
+  - Workers communicate via HTTP or stdin/stdout, isolating heavy models from the core runtime
+
+### Security Guarantees
+
+After this release:
+- **No shell execution** — `bash`, `shell`, `exec`, `eval` tools do not exist in the registry and cannot be added to agents
+- **No agent self-modification** — agents cannot create, delete, or modify other agents or their own config via tools
+- **All external data sanitized** — files, fetches, and scrapes pass through HTML/JS stripping, null-byte removal, and control-character filtering before vault storage
+- **Agent whitelist enforcement** — agents can only use tools explicitly allowed at creation time
+- **Built-in immutability** — built-in agents cannot be deleted or modified
+- **Path traversal impossible** — `FileSystemService` limiter enforces bounds on all file operations
+
+---
+
 ## Prior Versions
 
 For earlier changes (mindmap graph builder, plugin architecture, Electron frontend, security manager, file system limiter, permission system), see the git history.

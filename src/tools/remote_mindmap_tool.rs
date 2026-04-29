@@ -1,4 +1,5 @@
 use serde_json;
+use serde_json::json;
 use crate::mindmap::MindMapService;
 use crate::tools::{Tool, ToolContext};
 use std::fs::File;
@@ -17,7 +18,7 @@ impl Tool for RemoteMindMapTool {
     }
 
     fn description(&self) -> &str {
-        "Downloads a public GitHub repository, builds a mind map from it, merges it with the local mind map, then wipes the temporary download. Only github.com repos are supported."
+        "Downloads a public GitHub repository, builds a mind map from it, and stores it in a quarantined remote graph. The user must review and approve it before it merges into the permanent local mind map. Only github.com repos are supported."
     }
 
     fn is_core(&self) -> bool {
@@ -119,16 +120,18 @@ impl Tool for RemoteMindMapTool {
             Some(&prefix),
         );
 
-        // Build local mindmap
-        let allowed: Vec<String> = ctx.fs.config().allowed_paths.clone();
-        let mut local_mm = MindMapService::new();
-        local_mm.build(&allowed, 3);
-
-        // Merge remote into local
+        // Store in quarantine (remote graph) — user must approve before merge
         let remote_graph = remote_mm.graph().clone();
-        local_mm.merge(&remote_graph);
+        ctx.mindmap.lock().unwrap().set_remote_graph(remote_graph.clone());
 
-        Ok(serde_json::to_value(local_mm.graph()).map_err(|e| e.to_string())?)
+        Ok(serde_json::to_value(json!({
+            "stored": true,
+            "quarantined": true,
+            "source": url,
+            "nodes": remote_graph.nodes.len(),
+            "edges": remote_graph.edges.len(),
+            "message": "Remote mindmap stored in quarantine. User must review and approve before it merges into the permanent local mindmap."
+        })).map_err(|e| e.to_string())?)
     }
 }
 

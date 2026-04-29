@@ -17,7 +17,7 @@ Avalon uses a **local micro-orchestrator** pattern: a Rust backend serves an Ele
 | Backend | Rust / Actix-web / reqwest | Model inference, tool execution, file system gating, permissions, debug logging, mind map generation |
 | Frontend | Electron / Vanilla JS | Chat UI, settings panel, permission dialogs, SSE streaming, mind map viewer |
 | Model | Ollama (local) or OpenAI API | LLM inference |
-| Storage | `.avalon_fs.json`, `.avalon_state.json`, `logs/` | Persistent config and debug logs |
+| Storage | `.avalon_fs.json`, `.avalon_state.json`, `logs/`, `.avalon.db` | Persistent config, debug logs, SQLite vault |
 
 **Communication:** JSON over HTTP. Server-Sent Events (SSE) for real-time chat streaming.
 
@@ -126,6 +126,10 @@ pub trait Tool: Send + Sync {
 - `fetch_url` — downloads content from URLs (text, images, PDFs)
 - `remote_mindmap` — downloads GitHub repos as zip, builds mind map, merges, deletes temp
 - `web_scrape` — recursively scrapes websites with BFS, robots.txt, rate limits
+- `vault_search` / `vault_read` — query and retrieve MindVault documents
+- `vision_search` / `vision_read` — query and retrieve VisionVault images
+- `dispatch_agent` — queue an agent task
+- `board_post` / `board_read` — inter-agent messaging
 
 ---
 
@@ -153,7 +157,7 @@ Exploratory keywords trigger automatic mind map building:
 |------|---------|
 | `.avalon_fs.json` | File system limiter rules |
 | `.avalon_state.json` | App state (model, active tools, AI name, web fetch config) |
-| `logs/avalon-debug-*.md` | Saved debug logs |
+| `logs/debug/` | Saved debug logs (chat history + events) |
 
 ---
 
@@ -186,9 +190,106 @@ Exploratory keywords trigger automatic mind map building:
 
 ---
 
+## 6. Vault Services
+
+### 6.1 MindVault (`src/vault.rs`)
+
+- **Storage**: SQLite `vault_documents` table + `vault_fts` FTS5 virtual table
+- **Auto-ingest**: File writes, URL fetches, and web scrapes automatically commit text content
+- **Deduplication**: SHA-256 hash prevents duplicate ingestion
+- **Sanitization pipeline**: null-byte removal, control-character stripping, whitespace normalization, HTML tag stripping
+
+### 6.2 VisionVault (`src/vision.rs`)
+
+- **Storage**: SQLite `vision_images` table + `vision_fts` FTS5 virtual table
+- **Auto-ingest**: Image reads via `/api/fs/image` automatically store metadata
+- **Format detection**: Magic-byte-based identification (PNG, JPEG, GIF, WebP, BMP)
+- **Dimension extraction**: Header parsing without external dependencies
+- **Confirmation workflow**: Images ingested with `confirmed = 0`; user confirms via API
+
+### 6.3 Agent System (`src/agents.rs`)
+
+- **Registry**: SQLite `agents` table with whitelisted `allowed_tools`
+- **Security**: Forbidden tools (`bash`, `shell`, `exec`, `eval`, `create_agent`, `delete_agent`, `update_agent`) rejected at creation time
+- **Dispatch**: `agent_dispatches` table tracks status lifecycle
+- **Board**: `agent_board` table for per-dispatch messaging
+- **Memory**: `agent_memory` table for session summaries
+
+---
+
+## 7. Database Schema
+
+Single SQLite file `.avalon.db` with the following tables:
+
+| Table | Purpose |
+|-------|---------|
+| `vault_documents` | MindVault documents |
+| `vault_fts` | FTS5 virtual table for document search |
+| `vision_images` | VisionVault image metadata |
+| `vision_fts` | FTS5 virtual table for image search |
+| `agents` | Agent definitions |
+| `agent_dispatches` | Task dispatch records |
+| `agent_board` | Inter-agent messages |
+| `agent_memory` | Session summaries |
+
+---
+
+## 8. API Surface
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET | `/api/models` | List available models |
+| GET/POST | `/api/model` | Get/set current model |
+| GET | `/api/preload` | Preload a model in Ollama |
+| GET | `/api/chat` | SSE chat stream |
+| GET | `/api/debug` | Get debug log |
+| POST | `/api/debug/clear` | Clear debug log |
+| POST | `/api/debug/save` | Save debug log to file |
+| POST | `/api/permission` | Approve/deny a tool |
+| GET | `/api/permissions` | List active permissions |
+| DELETE | `/api/permissions/{tool}` | Revoke a permission |
+| GET | `/api/about` | App metadata |
+| GET | `/api/tools` | List all registered tools |
+| POST | `/api/plugins` | Set active tools |
+| GET/POST | `/api/ai_name` | Get/set AI assistant name |
+| GET | `/api/mindmap` | Get the codebase graph |
+| GET/POST | `/api/fs/config` | Get/set file system limiter config |
+| GET/POST | `/api/web/config` | Get/set web fetch config |
+| GET/POST | `/api/security/config` | Get/set security config |
+| GET/POST | `/api/audit/config` | Get/set audit config |
+| POST | `/api/fs/read` | Read a file |
+| POST | `/api/fs/write` | Write a file |
+| POST | `/api/fs/list` | List a directory |
+| POST | `/api/fs/delete` | Delete a file/directory |
+| POST | `/api/fs/image` | Read an image file |
+| POST | `/api/fetch` | Direct fetch URL |
+| POST | `/api/spellcheck` | Spell check |
+| GET | `/api/vault/search` | Search MindVault |
+| GET | `/api/vault/document/{id}` | Get MindVault document |
+| DELETE | `/api/vault/document/{id}` | Delete MindVault document |
+| GET | `/api/vision/search` | Search VisionVault |
+| GET | `/api/vision/image/{id}` | Get VisionVault image |
+| POST | `/api/vision/confirm/{id}` | Confirm image description |
+| DELETE | `/api/vision/image/{id}` | Delete VisionVault image |
+| GET | `/api/agents` | List agents |
+| POST | `/api/agents` | Create agent |
+| GET | `/api/agents/{name}` | Get agent |
+| POST | `/api/agents/{name}` | Update agent |
+| DELETE | `/api/agents/{name}` | Delete agent |
+| POST | `/api/agents/dispatch` | Dispatch agent |
+| GET | `/api/agents/dispatch/{id}` | Get dispatch |
+| POST | `/api/agents/dispatch/{id}/cancel` | Cancel dispatch |
+| GET | `/api/agents/dispatch/{id}/board` | Read board |
+| POST | `/api/agents/dispatch/{id}/board` | Post to board |
+| POST | `/v1/infer` | Legacy inference endpoint |
+
+---
+
 ## 9. Future Directions
 
 - **Multi-model sessions** — switch models mid-conversation
 - **Code execution sandbox** — safe, isolated execution of generated code
 - **Git integration** — diff, commit, and branch operations via tools
 - **Persistent memory** — long-term knowledge across sessions
+- **Agent execution** — full in-loop agent executor with model inference
+- **Image generation workers** — integrate Stable Diffusion or DALL-E via `AgentWorker` trait

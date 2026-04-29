@@ -3,6 +3,23 @@ use std::path::{Path, PathBuf};
 use base64::{Engine as _, engine::general_purpose};
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Project Root Detection
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn project_dir() -> PathBuf {
+    std::env::current_exe()
+        .ok()
+        .and_then(|mut p| {
+            // exe is in target/release/ or target/debug/
+            p.pop(); // release/debug
+            p.pop(); // target
+            p.pop(); // project root
+            Some(p)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default())
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // File System Configuration (Limiter)
 // ═════════════════════════════════════════════════════════════════════════════
 
@@ -120,7 +137,7 @@ fn strip_unc_prefix(s: String) -> String {
     s.strip_prefix("\\\\?\\").map(String::from).unwrap_or(s)
 }
 
-fn normalize_path(p: &str) -> String {
+pub fn normalize_path(p: &str) -> String {
     let path = PathBuf::from(p);
 
     // Try canonicalize first for existing paths (resolves symlinks)
@@ -133,7 +150,7 @@ fn normalize_path(p: &str) -> String {
     let abs = if path.is_absolute() {
         path
     } else {
-        std::env::current_dir().unwrap_or_default().join(path)
+        project_dir().join(path)
     };
 
     let mut cleaned = PathBuf::new();
@@ -202,7 +219,8 @@ impl FileSystemService {
     }
 
     pub fn read_file(&self, path: &str) -> FileOperationResult {
-        if let Err(e) = self.check_limiter(path) {
+        let path = normalize_path(path);
+        if let Err(e) = self.check_limiter(&path) {
             return FileOperationResult {
                 success: false,
                 path: path.to_string(),
@@ -212,12 +230,12 @@ impl FileSystemService {
             };
         }
 
-        match std::fs::metadata(path) {
+        match std::fs::metadata(&path) {
             Ok(meta) => {
                 if meta.len() > self.config.max_file_size as u64 {
                     return FileOperationResult {
                         success: false,
-                        path: path.to_string(),
+                        path: path.clone(),
                         content: None,
                         error: Some(format!(
                             "File too large: {} MB (max {} MB)",
@@ -239,17 +257,17 @@ impl FileSystemService {
             }
         }
 
-        match std::fs::read_to_string(path) {
+        match std::fs::read_to_string(&path) {
             Ok(content) => FileOperationResult {
                 success: true,
-                path: path.to_string(),
+                path: path.clone(),
                 content: Some(content),
                 error: None,
                 entries: None,
             },
             Err(e) => FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(format!("Failed to read file: {}", e)),
                 entries: None,
@@ -260,10 +278,11 @@ impl FileSystemService {
     /// Read an image file and scan for hidden data / steganography.
     /// Returns base64-encoded image, with warnings about any anomalies found.
     pub fn read_image(&self, path: &str) -> ImageReadResult {
-        if let Err(e) = self.check_limiter(path) {
+        let path = normalize_path(path);
+        if let Err(e) = self.check_limiter(&path) {
             return ImageReadResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 base64: None,
                 mime_type: None,
                 warnings: vec![e],
@@ -271,7 +290,7 @@ impl FileSystemService {
             };
         }
 
-        let meta = match std::fs::metadata(path) {
+        let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => return ImageReadResult {
                 success: false,
@@ -286,7 +305,7 @@ impl FileSystemService {
         if meta.len() > self.config.max_file_size as u64 {
             return ImageReadResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 base64: None,
                 mime_type: None,
                 warnings: Vec::new(),
@@ -298,11 +317,11 @@ impl FileSystemService {
             };
         }
 
-        let bytes = match std::fs::read(path) {
+        let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(e) => return ImageReadResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 base64: None,
                 mime_type: None,
                 warnings: Vec::new(),
@@ -310,7 +329,7 @@ impl FileSystemService {
             },
         };
 
-        let ext = Path::new(path)
+        let ext = Path::new(&path)
             .extension()
             .and_then(|e| e.to_str())
             .unwrap_or("")
@@ -341,7 +360,7 @@ impl FileSystemService {
 
         ImageReadResult {
             success: true,
-            path: path.to_string(),
+            path: path.clone(),
             base64: Some(b64),
             mime_type: Some(mime.to_string()),
             warnings,
@@ -420,10 +439,11 @@ impl FileSystemService {
     }
 
     pub fn write_file(&self, path: &str, content: &str) -> FileOperationResult {
-        if let Err(e) = self.check_limiter(path) {
+        let path = normalize_path(path);
+        if let Err(e) = self.check_limiter(&path) {
             return FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(e),
                 entries: None,
@@ -431,11 +451,11 @@ impl FileSystemService {
         }
 
         // Ensure parent directory exists
-        if let Some(parent) = Path::new(path).parent() {
+        if let Some(parent) = Path::new(&path).parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 return FileOperationResult {
                     success: false,
-                    path: path.to_string(),
+                    path: path.clone(),
                     content: None,
                     error: Some(format!("Failed to create parent directory: {}", e)),
                     entries: None,
@@ -443,17 +463,17 @@ impl FileSystemService {
             }
         }
 
-        match std::fs::write(path, content) {
+        match std::fs::write(&path, content) {
             Ok(()) => FileOperationResult {
                 success: true,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: None,
                 entries: None,
             },
             Err(e) => FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(format!("Failed to write file: {}", e)),
                 entries: None,
@@ -462,17 +482,18 @@ impl FileSystemService {
     }
 
     pub fn list_dir(&self, path: &str) -> FileOperationResult {
-        if let Err(e) = self.check_limiter(path) {
+        let path = normalize_path(path);
+        if let Err(e) = self.check_limiter(&path) {
             return FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(e),
                 entries: None,
             };
         }
 
-        match std::fs::read_dir(path) {
+        match std::fs::read_dir(&path) {
             Ok(entries) => {
                 let names: Vec<String> = entries
                     .filter_map(|e| e.ok())
@@ -485,7 +506,7 @@ impl FileSystemService {
                     .collect();
                 FileOperationResult {
                     success: true,
-                    path: path.to_string(),
+                    path: path.clone(),
                     content: None,
                     error: None,
                     entries: Some(names),
@@ -493,31 +514,32 @@ impl FileSystemService {
             }
             Err(e) => FileOperationResult {
                 success: false,
-                path: path.to_string(),
-                content: None,
+                path: path.clone(),
                 error: Some(format!("Failed to list directory: {}", e)),
+                content: None,
                 entries: None,
             },
         }
     }
 
     pub fn delete_file(&self, path: &str) -> FileOperationResult {
-        if let Err(e) = self.check_limiter(path) {
+        let path = normalize_path(path);
+        if let Err(e) = self.check_limiter(&path) {
             return FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(e),
                 entries: None,
             };
         }
 
-        let meta = match std::fs::metadata(path) {
+        let meta = match std::fs::metadata(&path) {
             Ok(m) => m,
             Err(e) => {
                 return FileOperationResult {
                     success: false,
-                    path: path.to_string(),
+                    path: path.clone(),
                     content: None,
                     error: Some(format!("Failed to read metadata: {}", e)),
                     entries: None,
@@ -526,22 +548,22 @@ impl FileSystemService {
         };
 
         let result = if meta.is_dir() {
-            std::fs::remove_dir_all(path)
+            std::fs::remove_dir_all(&path)
         } else {
-            std::fs::remove_file(path)
+            std::fs::remove_file(&path)
         };
 
         match result {
             Ok(()) => FileOperationResult {
                 success: true,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: None,
                 entries: None,
             },
             Err(e) => FileOperationResult {
                 success: false,
-                path: path.to_string(),
+                path: path.clone(),
                 content: None,
                 error: Some(format!("Failed to delete: {}", e)),
                 entries: None,

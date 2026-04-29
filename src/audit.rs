@@ -55,6 +55,7 @@ pub struct AuditLog {
     hot_dir: PathBuf,
     warm_dir: PathBuf,
     cold_dir: PathBuf,
+    debug_dir: PathBuf,
     max_mem_entries: usize,
 }
 
@@ -71,10 +72,12 @@ impl AuditLog {
         let hot_dir = project_dir.join("logs").join("audit").join("active");
         let warm_dir = project_dir.join("logs").join("audit").join("warm");
         let cold_dir = project_dir.join("archive").join("audit");
+        let debug_dir = project_dir.join("logs").join("debug");
 
         let _ = fs::create_dir_all(&hot_dir);
         let _ = fs::create_dir_all(&warm_dir);
         let _ = fs::create_dir_all(&cold_dir);
+        let _ = fs::create_dir_all(&debug_dir);
 
         let session_id = format!("sess-{}", std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -89,6 +92,7 @@ impl AuditLog {
             hot_dir,
             warm_dir,
             cold_dir,
+            debug_dir,
             max_mem_entries: 5000,
         }
     }
@@ -312,7 +316,10 @@ impl AuditLog {
         md.push_str("4. The Merkle root in the manifest is the recursive pairwise hash of all entry hashes.\n");
         md.push_str("\nTo re-verify programmatically, use `/api/audit/verify/{session_id}`.\n");
 
-        Ok(md)
+        let out_path = self.hot_dir.join(format!("{}_report.md", session_id));
+        fs::write(&out_path, &md)
+            .map_err(|e| format!("Cannot write report: {}", e))?;
+        Ok(out_path.to_string_lossy().to_string())
     }
 
     /// Archive old sessions into warm tier (daily tar.gz)
@@ -397,9 +404,41 @@ impl AuditLog {
             .collect()
     }
 
-    /// Backward-compatible: save debug-style Markdown of current session
+    /// Save debug-style Markdown to the manual debug directory (logs/debug/)
     pub fn save_to_file(&self) -> Result<String, String> {
-        self.export_chain_of_custody(&self.session_id)
+        let out_path = self.debug_dir.join(format!("{}_debug.md", self.session_id));
+        let report = self.verify_session(&self.session_id)?;
+        let path = self.hot_dir.join(format!("{}.ndjson", self.session_id));
+        let file = fs::File::open(&path).map_err(|e| format!("Cannot open: {}", e))?;
+        let reader = io::BufReader::new(file);
+
+        let mut md = String::new();
+        md.push_str(&format!("# Debug Report\n\n"));
+        md.push_str(&format!("**Session ID:** `{}`\n\n", self.session_id));
+        md.push_str(&format!("**Generated:** {}\n\n", chrono::Utc::now().to_rfc3339()));
+        md.push_str(&format!("**Entry Count:** {}\n\n", report.entry_count));
+        md.push_str(&format!("**Hash Chain Integrity:** {}\n\n", if report.broken_at.is_none() { "VERIFIED" } else { "BROKEN" }));
+        if let Some(seq) = report.broken_at {
+            md.push_str(&format!("**Broken At Entry:** {}\n\n", seq));
+        }
+        md.push_str("---\n\n");
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("Read error: {}", e))?;
+            if line.trim().is_empty() { continue; }
+            let entry: AuditEntry = serde_json::from_str(&line)
+                .map_err(|e| format!("Parse error: {}", e))?;
+            md.push_str(&format!("## Entry {} — `{}`\n\n", entry.seq, entry.entry_type));
+            md.push_str(&format!("- **Timestamp:** {}\n", entry.timestamp.to_rfc3339()));
+            md.push_str(&format!("- **Actor:** {}\n", entry.actor));
+            md.push_str(&format!("- **Data:**\n```json\n{}\n```\n\n",
+                serde_json::to_string_pretty(&entry.data).unwrap_or_default()
+            ));
+        }
+
+        fs::write(&out_path, &md)
+            .map_err(|e| format!("Cannot write report: {}", e))?;
+        Ok(out_path.to_string_lossy().to_string())
     }
 
     /// Backward-compatible: clear in-memory buffer
@@ -416,6 +455,10 @@ impl AuditLog {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    pub fn debug_dir(&self) -> &PathBuf {
+        &self.debug_dir
     }
 }
 

@@ -8,8 +8,8 @@
 </head>
 <body>
 
-<header>
-  <div>
+<header id="appHeader">
+  <div class="header-brand">
     <h1>Avalon</h1>
     <div class="subtitle">Your AI working harness</div>
   </div>
@@ -17,7 +17,16 @@
     <label for="model">Model</label>
     <select id="model"></select>
     <button class="preload-btn" id="preloadBtn">Preload</button>
+    <button class="settings-btn" id="resetChatBtn" title="Clear Chat">&#x2715;</button>
+    <button class="settings-btn" id="vaultBtn" title="Vault">&#x1F5C3;</button>
+    <button class="settings-btn" id="agentBtn" title="Agents">&#x1F916;</button>
+    <button class="settings-btn" id="mapBtn" title="Project Map">&#x26F6;</button>
     <button class="settings-btn" id="settingsBtn" title="Settings">&#x2699;</button>
+  </div>
+  <div class="window-controls">
+    <button class="win-btn minimize" id="winMinBtn" title="Minimize">&#x2013;</button>
+    <button class="win-btn maximize" id="winMaxBtn" title="Maximize">&#x25A1;</button>
+    <button class="win-btn close" id="winCloseBtn" title="Close">&#x2715;</button>
   </div>
 </header>
 
@@ -35,7 +44,7 @@
     </div>
 
     <div class="input-bar">
-      <textarea id="userInput" rows="1" placeholder="Ask anything..." autofocus></textarea>
+      <textarea id="userInput" rows="1" placeholder="Ask anything..." spellcheck="true" autofocus></textarea>
       <button class="fetch-btn" id="fetchBtn" title="Direct Fetch">&#x2193;</button>
       <button class="send-btn" id="sendBtn">Send</button>
     </div>
@@ -52,9 +61,17 @@
   <!-- Mindmap viewer -->
   <div class="mindmap-overlay hidden" id="mindmapOverlay">
     <div class="mindmap-header">
-      <span>Mind Map</span>
+      <div class="mindmap-tabs">
+        <button class="mindmap-tab active" id="tabLocal" data-tab="local">Local</button>
+        <button class="mindmap-tab" id="tabRemote" data-tab="remote">Remote</button>
+      </div>
       <div class="mindmap-actions">
+        <button id="mindmapZoomOutBtn">–</button>
+        <button id="mindmapZoomInBtn">+</button>
+        <button id="mindmapRefreshBtn">Refresh</button>
         <button id="mindmapResetBtn">Reset</button>
+        <button id="mindmapMergeBtn" class="hidden">Merge</button>
+        <button id="mindmapClearBtn" class="hidden">Clear</button>
         <button id="mindmapCloseBtn">&#x2715;</button>
       </div>
     </div>
@@ -83,6 +100,40 @@
     </div>
   </div>
 
+  <!-- Vault overlay -->
+  <div class="mindmap-overlay hidden" id="vaultOverlay">
+    <div class="mindmap-header">
+      <div class="mindmap-tabs">
+        <button class="mindmap-tab active" id="tabVaultDocs" data-tab="docs">Documents</button>
+        <button class="mindmap-tab" id="tabVaultImages" data-tab="images">Images</button>
+      </div>
+      <div class="mindmap-actions">
+        <button id="vaultCloseBtn">&#x2715;</button>
+      </div>
+    </div>
+    <div class="vault-container" id="vaultContainer">
+      <div class="vault-search-bar">
+        <input type="text" id="vaultSearchInput" placeholder="Search vault..." />
+        <button id="vaultSearchBtn">Search</button>
+      </div>
+      <div class="vault-results" id="vaultResults"></div>
+    </div>
+  </div>
+
+  <!-- Agent overlay -->
+  <div class="mindmap-overlay hidden" id="agentOverlay">
+    <div class="mindmap-header">
+      <span>Agent Management</span>
+      <div class="mindmap-actions">
+        <button id="agentRefreshBtn">Refresh</button>
+        <button id="agentCloseBtn">&#x2715;</button>
+      </div>
+    </div>
+    <div class="vault-container" id="agentContainer" style="padding: 20px; overflow-y: auto;">
+      <div id="agentContent"></div>
+    </div>
+  </div>
+
   <!-- Debug panel -->
   <div class="debug-panel collapsed" id="debugPanel">
     <div class="debug-toggle" id="debugToggle">
@@ -103,6 +154,8 @@
   <span><span class="dot" id="statusDot"></span><span id="statusText">Loading models...</span></span>
   <span id="iterCount"></span>
 </div>
+
+  <div class="spell-menu hidden" id="spellMenu"></div>
 
 <script src="app.js"></script>
 </body>

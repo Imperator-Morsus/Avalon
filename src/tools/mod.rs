@@ -9,10 +9,22 @@ pub mod mindmap_tool;
 pub mod fetch_tool;
 pub mod remote_mindmap_tool;
 pub mod web_scrape_tool;
+pub mod video_tool;
+pub mod vault_search_tool;
+pub mod vault_read_tool;
+pub mod vision_search_tool;
+pub mod vision_read_tool;
+pub mod dispatch_agent_tool;
+pub mod board_post_tool;
+pub mod board_read_tool;
 
 pub struct ToolContext<'a> {
     pub fs: &'a FileSystemService,
     pub web_fetch: &'a crate::WebFetchConfig,
+    pub security: &'a crate::SecurityConfig,
+    pub mindmap: &'a std::sync::Mutex<crate::mindmap::MindMapService>,
+    pub vault: &'a std::sync::Mutex<crate::vault::VaultService>,
+    pub vision: &'a std::sync::Mutex<crate::vision::VisionService>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

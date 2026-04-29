@@ -2,6 +2,11 @@ mod fs;
 mod tools;
 mod mindmap;
 mod audit;
+mod db;
+mod vault;
+mod vision;
+mod agents;
+mod agent_workers;
 
 use actix_cors::Cors;
 use actix_web::{web, App, HttpResponse, HttpServer};
@@ -12,10 +17,11 @@ use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use audit::AuditLog;
+use db::VaultDb;
 use fs::{FileSystemService, FileSystemConfig};
 use mindmap::MindMapService;
 use crate::tools::Tool;
@@ -50,6 +56,16 @@ pub struct InferenceRequest {
 }
 
 fn default_ai_name() -> String { "Avalon".to_string() }
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SpellcheckRequest {
+    text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SpellcheckResponse {
+    corrected: String,
+}
 
 #[derive(Debug, Clone, Serialize)]
 struct InferenceResponse {
@@ -209,6 +225,7 @@ pub struct AppConfig {
     pub ai_name: String,
     pub web_fetch: WebFetchConfig,
     pub audit: AuditConfig,
+    pub security: SecurityConfig,
 }
 
 impl AppConfig {
@@ -229,6 +246,7 @@ impl AppConfig {
             .unwrap_or_else(|| "Avalon".to_string());
         let web_fetch = WebFetchConfig::load();
         let audit = AuditConfig::load();
+        let security = SecurityConfig::load();
         AppConfig {
             current_model,
             api_base: env::var("AVALON_MODEL_API_BASE").unwrap_or_else(|_| "http://localhost:11434/v1".to_string()),
@@ -236,6 +254,7 @@ impl AppConfig {
             ai_name,
             web_fetch,
             audit,
+            security,
         }
     }
 }
@@ -270,6 +289,45 @@ impl AuditConfig {
     pub fn save(&self) -> Result<(), String> {
         let mut persisted = ConfigStore::load();
         persisted.insert("audit".to_string(), json!(self));
+        ConfigStore::save(&persisted);
+        Ok(())
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Security Config
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SecurityConfig {
+    pub block_private_ips: bool,
+    pub enforce_html_sanitize: bool,
+    pub require_write_permission: bool,
+    pub require_delete_permission: bool,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        SecurityConfig {
+            block_private_ips: true,
+            enforce_html_sanitize: true,
+            require_write_permission: true,
+            require_delete_permission: true,
+        }
+    }
+}
+
+impl SecurityConfig {
+    pub fn load() -> Self {
+        let persisted = ConfigStore::load();
+        persisted.get("security")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self) -> Result<(), String> {
+        let mut persisted = ConfigStore::load();
+        persisted.insert("security".to_string(), json!(self));
         ConfigStore::save(&persisted);
         Ok(())
     }
@@ -396,7 +454,7 @@ impl HttpModelService {
             api_base.clone()
         };
         let model_name = env::var("AVALON_MODEL_NAME")
-            .unwrap_or_else(|_| "llama3".to_string());
+            .unwrap_or_else(|_| "qwen2.5-coder:32b".to_string());
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(600))
@@ -416,7 +474,9 @@ impl HttpModelService {
     fn build_messages(&self, req: &InferenceRequest) -> Vec<serde_json::Value> {
         let system_msg = json!({
             "role": "system",
-            "content": format!("You are {}, a context-aware AI coding assistant. Respond in Markdown.\n\nYou have access to the local file system via structured tool calls. When you need to read, write, or edit a file, output a tool call block like this:\n\n<tool>\n<name>read_file</name>\n<input>{{\"path\": \"src/main.rs\"}}</input>\n</tool>\n\n{}\n\nWhen you need to reason through a problem, plan code, or work through logic step-by-step, wrap your internal thinking in <thinking>...</thinking> tags. Provide your final answer after the closing </thinking> tag. Only the content outside the tags will be shown to the user.", req.ai_name, self.tools_description)
+            "content": format!("You are {}, a context-aware AI coding assistant. Respond in Markdown.\n\nYou have access to the local file system and network via structured tool calls. When you need to read, write, edit, fetch URLs, or execute tools, output a tool call block like this:\n\n<tool>\n<name>read_file</name>\n<input>{{\"path\": \"src/main.rs\"}}</input>\n</tool>\n\n{}\n\nWhen you need to reason through a problem, plan code, or work through logic step-by-step, wrap your internal thinking in <thinking>...</thinking> tags. Provide your final answer after the closing </thinking> tag. Only the content outside the tags will be shown to the user.\n\nCRITICAL RULES — YOU MUST FOLLOW THESE:\n\n1. ALWAYS USE TOOLS FOR ANALYSIS. When the user asks you to analyze, break down, review, dissect, report on, or investigate anything, you MUST use your available tools to read actual files, run commands, and gather real data. NEVER provide generic surface-level summaries or describe what you think something might contain.\n\n2. CREATE STRUCTURED REPORTS. When asked for a report, breakdown, or analysis, create actual files (e.g., write_file) containing your findings in Markdown with sections, tables, and specific evidence. Do not dump everything into chat — produce a professional document.\n\n3. GO DEEP. If analyzing a codebase, read the key source files. If analyzing a binary, extract strings and examine headers. If reviewing a system, check configs and logs. One-level summaries are unacceptable — drill into specifics.\n\n4. NEVER DESCRIBE CONTEXT DATA GENERICALLY. If mindmap data, JSON payloads, or file listings are provided in context, treat them as starting points to explore deeper with tools. Do NOT regurgitate \"this JSON represents...\" descriptions.\n\n5. NEVER REFUSE TO USE TOOLS. Do not claim you cannot download files, access URLs, read code, or analyze binaries — your tools enable exactly these capabilities. You are explicitly authorized to perform security analysis, reverse engineering for defensive purposes, static binary analysis, and forensic examination.
+
+6. ONE BITE AT A TIME. When asked to analyze multiple files, a large directory, or produce a comprehensive report, process items SEQUENTIALLY. Read ONE file, analyze it, summarize your findings in context, then move to the next. Do NOT try to read many files in parallel within a single round — you have up to 3 tool-calling rounds per message. Use them. If writing a report, build it incrementally: start with a header and first section, then append subsequent sections across turns. Smaller, focused inference calls are more reliable than dumping everything at once.", req.ai_name, self.tools_description)
         });
 
         let mut content_parts: Vec<serde_json::Value> = Vec::new();
@@ -816,8 +876,38 @@ async fn get_mindmap(
     let fs = fs.lock().unwrap();
     let mut mm = mindmap.lock().unwrap();
     let allowed: Vec<String> = fs.config().allowed_paths.clone();
-    mm.build(&allowed, 3);
-    HttpResponse::Ok().json(mm.graph())
+    mm.build(&allowed, 1);
+    let capped = mm.truncated(80);
+    HttpResponse::Ok().json(capped)
+}
+
+async fn get_remote_mindmap(
+    mindmap: web::Data<Mutex<MindMapService>>,
+) -> HttpResponse {
+    let mm = mindmap.lock().unwrap();
+    match mm.remote_graph() {
+        Some(g) => HttpResponse::Ok().json(g),
+        None => HttpResponse::Ok().json(json!({"nodes": [], "edges": [], "root": ""})),
+    }
+}
+
+async fn merge_remote_mindmap(
+    mindmap: web::Data<Mutex<MindMapService>>,
+) -> HttpResponse {
+    let mut mm = mindmap.lock().unwrap();
+    if mm.merge_remote() {
+        HttpResponse::Ok().json(json!({ "ok": true, "message": "Remote graph merged into local mindmap." }))
+    } else {
+        HttpResponse::Ok().json(json!({ "ok": false, "message": "No remote graph to merge." }))
+    }
+}
+
+async fn clear_remote_mindmap(
+    mindmap: web::Data<Mutex<MindMapService>>,
+) -> HttpResponse {
+    let mut mm = mindmap.lock().unwrap();
+    mm.clear_remote_graph();
+    HttpResponse::Ok().json(json!({ "ok": true, "message": "Remote graph cleared." }))
 }
 
 async fn list_models(
@@ -903,6 +993,9 @@ async fn chat_handler(
     config: web::Data<Mutex<AppConfig>>,
     fs: web::Data<Mutex<FileSystemService>>,
     registry: web::Data<Mutex<tools::ToolRegistry>>,
+    mindmap: web::Data<Mutex<MindMapService>>,
+    vault_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vault::VaultService>>>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
 ) -> HttpResponse {
     let message = query.get("message").cloned().unwrap_or_default();
     let selected_model = query.get("model").cloned()
@@ -929,9 +1022,10 @@ async fn chat_handler(
         let fs_svc = fs.lock().unwrap();
         let mut mm = MindMapService::new();
         let allowed: Vec<String> = fs_svc.config().allowed_paths.clone();
-        mm.build(&allowed, 3);
-        let payload = serde_json::to_value(mm.graph()).unwrap_or(serde_json::Value::Null);
-        audit_log.lock().unwrap().push("mindmap_build", json!({"nodes": mm.graph().nodes.len(), "edges": mm.graph().edges.len()}));
+        mm.build(&allowed, 1); // Shallow: only top-level structure to avoid overwhelming local models
+        let capped = mm.truncated(80); // Cap at 80 nodes to keep context small
+        let payload = serde_json::to_value(&capped).unwrap_or(serde_json::Value::Null);
+        audit_log.lock().unwrap().push("mindmap_build", json!({"nodes": capped.nodes.len(), "edges": capped.edges.len(), "capped": true}));
         payload
     } else {
         serde_json::Value::Null
@@ -969,7 +1063,7 @@ async fn chat_handler(
     let mut sse_events: Vec<String> = Vec::new();
 
     let (reasoning, final_answer) = if !calls.is_empty() {
-        // Emit tool_call events
+        // Emit tool_call events for first round
         for call in &calls {
             let evt = format_sse_event("tool_call", &json!({
                 "tool": call.name,
@@ -978,76 +1072,25 @@ async fn chat_handler(
             sse_events.push(evt);
         }
 
-        // Execute tool calls and build follow-up
-        let fs_svc = fs.lock().unwrap();
-        let registry = registry.lock().unwrap();
-        let cfg = config.lock().unwrap();
-        let active_set: HashSet<String> = cfg.active_tools.iter().cloned().collect();
-        let mut tool_results: Vec<serde_json::Value> = Vec::new();
-        for call in &calls {
-            let is_core = registry.get(&call.name).map(|t| t.is_core()).unwrap_or(false);
-            if !active_set.contains(&call.name) && !is_core {
-                let e = format!("Tool '{}' is deactivated. Activate it in Settings > Plugins to use it.", call.name);
-                audit_log.lock().unwrap().push_assistant("tool_error", json!({
-                    "tool": call.name,
-                    "input": call.input,
-                    "error": &e
-                }));
-                let err_evt = format_sse_event("tool_result", &json!({
-                    "tool": call.name,
-                    "observation": format!("Error: {}", e)
-                }).to_string());
-                sse_events.push(err_evt);
-                tool_results.push(json!({
-                    "tool": call.name,
-                    "input": call.input,
-                    "error": e
-                }));
-                continue;
-            }
-            match registry.get(&call.name) {
-                Some(tool) => {
-                    match tool.execute(call.input.clone(), &tools::ToolContext { fs: &fs_svc, web_fetch: &cfg.web_fetch }).await {
-                        Ok(result) => {
-                            audit_log.lock().unwrap().push_assistant("tool_call", json!({
-                                "tool": call.name,
-                                "input": call.input,
-                                "success": true,
-                                "result": &result
-                            }));
-                            let result_evt = format_sse_event("tool_result", &json!({
-                                "tool": call.name,
-                                "observation": serde_json::to_string(&result).unwrap_or_default()
-                            }).to_string());
-                            sse_events.push(result_evt);
-                            tool_results.push(json!({
-                                "tool": call.name,
-                                "input": call.input,
-                                "result": result
-                            }));
-                        }
-                        Err(e) => {
-                            audit_log.lock().unwrap().push_assistant("tool_error", json!({
-                                "tool": call.name,
-                                "input": call.input,
-                                "error": e
-                            }));
-                            let err_evt = format_sse_event("tool_result", &json!({
-                                "tool": call.name,
-                                "observation": format!("Error: {}", e)
-                            }).to_string());
-                            sse_events.push(err_evt);
-                            tool_results.push(json!({
-                                "tool": call.name,
-                                "input": call.input,
-                                "error": e
-                            }));
-                        }
-                    }
-                }
-                None => {
-                    let e = format!("Unknown tool: {}", call.name);
-                    audit_log.lock().unwrap().push("tool_error", json!({
+        // Multi-round tool execution: keep calling tools until model stops or max rounds
+        let mut all_tool_results: Vec<serde_json::Value> = Vec::new();
+        let mut current_calls = calls;
+        let mut current_raw = raw_result.clone();
+        let max_rounds = 10;
+
+        for round in 0..max_rounds {
+            // Execute current round of tool calls
+            let fs_svc = fs.lock().unwrap();
+            let registry = registry.lock().unwrap();
+            let cfg = config.lock().unwrap();
+            let active_set: HashSet<String> = cfg.active_tools.iter().cloned().collect();
+            let mut round_results: Vec<serde_json::Value> = Vec::new();
+
+            for call in &current_calls {
+                let is_core = registry.get(&call.name).map(|t| t.is_core()).unwrap_or(false);
+                if !active_set.contains(&call.name) && !is_core {
+                    let e = format!("Tool '{}' is deactivated. Activate it in Settings > Plugins to use it.", call.name);
+                    audit_log.lock().unwrap().push_assistant("tool_error", json!({
                         "tool": call.name,
                         "input": call.input,
                         "error": &e
@@ -1057,44 +1100,128 @@ async fn chat_handler(
                         "observation": format!("Error: {}", e)
                     }).to_string());
                     sse_events.push(err_evt);
-                    tool_results.push(json!({
+                    round_results.push(json!({
                         "tool": call.name,
                         "input": call.input,
                         "error": e
                     }));
+                    continue;
+                }
+                match registry.get(&call.name) {
+                    Some(tool) => {
+                        match tool.execute(call.input.clone(), &tools::ToolContext { fs: &fs_svc, web_fetch: &cfg.web_fetch, security: &cfg.security, mindmap: &mindmap, vault: &vault_service, vision: &vision_service }).await {
+                            Ok(result) => {
+                                audit_log.lock().unwrap().push_assistant("tool_call", json!({
+                                    "tool": call.name,
+                                    "input": call.input,
+                                    "success": true,
+                                    "result": &result
+                                }));
+                                let result_evt = format_sse_event("tool_result", &json!({
+                                    "tool": call.name,
+                                    "observation": serde_json::to_string(&result).unwrap_or_default()
+                                }).to_string());
+                                sse_events.push(result_evt);
+                                round_results.push(json!({
+                                    "tool": call.name,
+                                    "input": call.input,
+                                    "result": result
+                                }));
+                            }
+                            Err(e) => {
+                                audit_log.lock().unwrap().push_assistant("tool_error", json!({
+                                    "tool": call.name,
+                                    "input": call.input,
+                                    "error": e
+                                }));
+                                let err_evt = format_sse_event("tool_result", &json!({
+                                    "tool": call.name,
+                                    "observation": format!("Error: {}", e)
+                                }).to_string());
+                                sse_events.push(err_evt);
+                                round_results.push(json!({
+                                    "tool": call.name,
+                                    "input": call.input,
+                                    "error": e
+                                }));
+                            }
+                        }
+                    }
+                    None => {
+                        let e = format!("Unknown tool: {}", call.name);
+                        audit_log.lock().unwrap().push("tool_error", json!({
+                            "tool": call.name,
+                            "input": call.input,
+                            "error": &e
+                        }));
+                        let err_evt = format_sse_event("tool_result", &json!({
+                            "tool": call.name,
+                            "observation": format!("Error: {}", e)
+                        }).to_string());
+                        sse_events.push(err_evt);
+                        round_results.push(json!({
+                            "tool": call.name,
+                            "input": call.input,
+                            "error": e
+                        }));
+                    }
                 }
             }
+            drop(registry);
+            drop(fs_svc);
+            all_tool_results.extend(round_results);
+
+            // Check if follow-up wants more tools
+            let stripped = strip_tool_blocks(&current_raw);
+            let follow_up_prompt = format!(
+                "{}",
+                serde_json::json!({
+                    "original_response": stripped,
+                    "tool_results": all_tool_results,
+                    "instruction": "Based on the tool results above, provide your answer. If you need more data to give a complete answer, call additional tools. Otherwise wrap reasoning in <thinking>...</thinking> tags and provide your final answer."
+                })
+            );
+
+            let follow_up_req = InferenceRequest {
+                prompt: follow_up_prompt,
+                user_context: String::new(),
+                mindmap_payload: serde_json::Value::Null,
+                image_archives: Vec::new(),
+                other_instances: serde_json::Value::Null,
+                model_params: json!({"model": selected_model}),
+                ai_name: ai_name.clone(),
+                history: history.clone(),
+            };
+
+            let follow_up_raw = match model_service.infer(&follow_up_req).await {
+                Ok(text) => text,
+                Err(e) => {
+                    let err_text = format!("Error during follow-up: {}", e);
+                    current_raw = err_text.clone();
+                    break;
+                }
+            };
+
+            let next_calls = parse_tool_calls(&follow_up_raw);
+            if next_calls.is_empty() {
+                // Model is done; use this as final
+                current_raw = follow_up_raw;
+                break;
+            }
+
+            // More tool calls requested — emit them and loop
+            for call in &next_calls {
+                let evt = format_sse_event("tool_call", &json!({
+                    "tool": call.name,
+                    "input": call.input
+                }).to_string());
+                sse_events.push(evt);
+            }
+            current_calls = next_calls;
+            current_raw = follow_up_raw;
         }
-        drop(registry);
-        drop(fs_svc);
 
-        let stripped = strip_tool_blocks(&raw_result);
-        let follow_up_prompt = format!(
-            "{}",
-            serde_json::json!({
-                "original_response": stripped,
-                "tool_results": tool_results,
-                "instruction": "Based on the tool results above, provide your final answer to the user. Wrap any step-by-step reasoning in <thinking>...</thinking> tags."
-            })
-        );
-
-        let follow_up_req = InferenceRequest {
-            prompt: follow_up_prompt,
-            user_context: String::new(),
-            mindmap_payload: serde_json::Value::Null,
-            image_archives: Vec::new(),
-            other_instances: serde_json::Value::Null,
-            model_params: json!({"model": selected_model}),
-            ai_name: ai_name.clone(),
-            history: history.clone(),
-        };
-
-        let follow_up_raw = match model_service.infer(&follow_up_req).await {
-            Ok(text) => text,
-            Err(e) => format!("Error during follow-up: {}", e),
-        };
-
-        let (r, ans) = parse_thinking(&follow_up_raw);
+        let (r, ans) = parse_thinking(&current_raw);
         (r, clean_response(&ans))
     } else {
         let (r, ans) = parse_thinking(&raw_result);
@@ -1141,10 +1268,30 @@ async fn clear_debug(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
-async fn save_debug(audit_log: web::Data<Mutex<AuditLog>>) -> HttpResponse {
-    match audit_log.lock().unwrap().save_to_file() {
-        Ok(path) => HttpResponse::Ok().json(json!({ "ok": true, "path": path })),
-        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+#[derive(Debug, Deserialize)]
+pub struct DebugSaveRequest {
+    pub content: Option<String>,
+}
+
+async fn save_debug(
+    body: web::Json<DebugSaveRequest>,
+    audit_log: web::Data<Mutex<AuditLog>>,
+) -> HttpResponse {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let filename = format!("avalon_session_{}.md", timestamp);
+    let debug_dir = audit_log.lock().unwrap().debug_dir().clone();
+    let path = debug_dir.join(&filename);
+
+    let content = body.content.as_deref().unwrap_or("");
+    match std::fs::write(&path, content) {
+        Ok(_) => HttpResponse::Ok().json(json!({
+            "ok": true,
+            "path": path.to_string_lossy().to_string()
+        })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e.to_string() })),
     }
 }
 
@@ -1281,6 +1428,7 @@ async fn fs_image(
     body: web::Json<FsImageRequest>,
     fs: web::Data<Mutex<FileSystemService>>,
     audit_log: web::Data<Mutex<AuditLog>>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
 ) -> HttpResponse {
     let result = fs.lock().unwrap().read_image(&body.path);
     audit_log.lock().unwrap().push("tool_call", json!({
@@ -1291,6 +1439,16 @@ async fn fs_image(
     if let Some(ref err) = result.error {
         audit_log.lock().unwrap().push("tool_error", json!({ "tool": "read_image", "error": err }));
     }
+
+    // Auto-ingest into VisionVault on successful read
+    if result.success {
+        let normalized = crate::fs::normalize_path(&body.path);
+        let _ = vision_service.lock().unwrap().ingest_image(
+            std::path::Path::new(&normalized),
+            None,
+        );
+    }
+
     HttpResponse::Ok().json(result)
 }
 
@@ -1363,6 +1521,283 @@ async fn fs_config_post(
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
+// Vault endpoints
+#[derive(Debug, Deserialize)]
+struct VaultSearchRequest {
+    q: String,
+    #[serde(default = "default_limit_10")]
+    limit: usize,
+}
+fn default_limit_10() -> usize { 10 }
+
+async fn vault_search(
+    query: web::Query<VaultSearchRequest>,
+    vault_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vault::VaultService>>>,
+) -> HttpResponse {
+    match vault_service.lock().unwrap().search(&query.q, query.limit) {
+        Ok(results) => HttpResponse::Ok().json(json!({ "results": results })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn vault_get_document(
+    path: web::Path<i64>,
+    vault_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vault::VaultService>>>,
+) -> HttpResponse {
+    match vault_service.lock().unwrap().get(path.into_inner()) {
+        Ok(Some(doc)) => HttpResponse::Ok().json(doc),
+        Ok(None) => HttpResponse::NotFound().json(json!({ "error": "Document not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn vault_delete_document(
+    path: web::Path<i64>,
+    vault_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vault::VaultService>>>,
+) -> HttpResponse {
+    match vault_service.lock().unwrap().delete(path.into_inner()) {
+        Ok(true) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "Document not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VisionVault HTTP handlers
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[derive(Debug, Deserialize)]
+struct VisionSearchRequest {
+    q: String,
+    #[serde(default = "default_vision_limit")]
+    limit: usize,
+}
+
+fn default_vision_limit() -> usize { 10 }
+
+async fn vision_search(
+    query: web::Query<VisionSearchRequest>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
+) -> HttpResponse {
+    match vision_service.lock().unwrap().search(&query.q, query.limit) {
+        Ok(results) => HttpResponse::Ok().json(json!({ "images": results })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn vision_get_image(
+    path: web::Path<i64>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
+) -> HttpResponse {
+    match vision_service.lock().unwrap().get(path.into_inner()) {
+        Ok(Some(img)) => HttpResponse::Ok().json(img),
+        Ok(None) => HttpResponse::NotFound().json(json!({ "error": "Image not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct VisionConfirmRequest {
+    description: String,
+    tags: Vec<String>,
+}
+
+async fn vision_confirm_image(
+    path: web::Path<i64>,
+    body: web::Json<VisionConfirmRequest>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
+) -> HttpResponse {
+    match vision_service.lock().unwrap().confirm_description(
+        path.into_inner(),
+        &body.description,
+        body.tags.clone(),
+    ) {
+        Ok(()) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn vision_delete_image(
+    path: web::Path<i64>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
+) -> HttpResponse {
+    match vision_service.lock().unwrap().delete(path.into_inner()) {
+        Ok(true) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "Image not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Agent HTTP handlers
+// ═════════════════════════════════════════════════════════════════════════════
+
+async fn agent_list(
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().list_agents() {
+        Ok(agents) => HttpResponse::Ok().json(json!({ "agents": agents })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn agent_get(
+    path: web::Path<String>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().get_agent(&path.into_inner()) {
+        Ok(Some(agent)) => HttpResponse::Ok().json(agent),
+        Ok(None) => HttpResponse::NotFound().json(json!({ "error": "Agent not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateAgentRequest {
+    name: String,
+    display_name: Option<String>,
+    role: String,
+    description: Option<String>,
+    system_prompt: Option<String>,
+    allowed_tools: Vec<String>,
+}
+
+async fn agent_create(
+    body: web::Json<CreateAgentRequest>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().create_agent(
+        &body.name,
+        body.display_name.as_deref(),
+        &body.role,
+        body.description.as_deref(),
+        body.system_prompt.as_deref(),
+        body.allowed_tools.as_slice(),
+    ) {
+        Ok(id) => HttpResponse::Ok().json(json!({ "id": id, "name": &body.name })),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UpdateAgentRequest {
+    display_name: Option<String>,
+    role: Option<String>,
+    description: Option<String>,
+    system_prompt: Option<String>,
+    allowed_tools: Option<Vec<String>>,
+}
+
+async fn agent_update(
+    path: web::Path<String>,
+    body: web::Json<UpdateAgentRequest>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().update_agent(
+        &path.into_inner(),
+        body.display_name.as_deref(),
+        body.role.as_deref(),
+        body.description.as_deref(),
+        body.system_prompt.as_deref(),
+        body.allowed_tools.as_deref(),
+    ) {
+        Ok(true) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "Agent not found" })),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": e })),
+    }
+}
+
+async fn agent_delete(
+    path: web::Path<String>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().delete_agent(&path.into_inner()) {
+        Ok(true) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "Agent not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct DispatchRequest {
+    agent_name: String,
+    task: String,
+}
+
+async fn agent_dispatch(
+    body: web::Json<DispatchRequest>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().create_dispatch(&body.agent_name, &body.task,
+    ) {
+        Ok(id) => HttpResponse::Ok().json(json!({ "dispatch_id": id, "status": "pending" })),
+        Err(e) => HttpResponse::BadRequest().json(json!({ "error": e })),
+    }
+}
+
+async fn agent_dispatch_get(
+    path: web::Path<i64>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().get_dispatch(path.into_inner()) {
+        Ok(Some(d)) => HttpResponse::Ok().json(d),
+        Ok(None) => HttpResponse::NotFound().json(json!({ "error": "Dispatch not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BoardPostRequest {
+    author: String,
+    content: String,
+    channel: Option<String>,
+}
+
+async fn agent_board_post(
+    path: web::Path<i64>,
+    body: web::Json<BoardPostRequest>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().post_to_board(
+        path.into_inner(),
+        &body.author,
+        body.channel.as_deref().unwrap_or("general"),
+        &body.content,
+    ) {
+        Ok(id) => HttpResponse::Ok().json(json!({ "post_id": id })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn agent_board_get(
+    path: web::Path<i64>,
+    query: web::Query<std::collections::HashMap<String, String>>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    let channel = query.get("channel").map(|s| s.as_str());
+    let since = query.get("since").map(|s| s.as_str());
+    match agent_registry.lock().unwrap().read_board(path.into_inner(), channel, since) {
+        Ok(posts) => HttpResponse::Ok().json(json!({ "posts": posts })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
+async fn agent_dispatch_cancel(
+    path: web::Path<i64>,
+    agent_registry: web::Data<std::sync::Arc<std::sync::Mutex<crate::agents::AgentRegistry>>>,
+) -> HttpResponse {
+    match agent_registry.lock().unwrap().update_dispatch_status(
+        path.into_inner(),
+        "cancelled",
+        None,
+        Some("Cancelled by user"),
+    ) {
+        Ok(true) => HttpResponse::Ok().json(json!({ "ok": true })),
+        Ok(false) => HttpResponse::NotFound().json(json!({ "error": "Dispatch not found" })),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct DirectFetchRequest {
     url: String,
@@ -1372,12 +1807,19 @@ async fn direct_fetch(
     body: web::Json<DirectFetchRequest>,
     config: web::Data<Mutex<AppConfig>>,
     audit_log: web::Data<Mutex<AuditLog>>,
+    mindmap: web::Data<Mutex<MindMapService>>,
+    vault_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vault::VaultService>>>,
+    vision_service: web::Data<std::sync::Arc<std::sync::Mutex<crate::vision::VisionService>>>,
 ) -> HttpResponse {
     let cfg = config.lock().unwrap();
     let fs_svc = fs::FileSystemService::new();
     let ctx = tools::ToolContext {
         fs: &fs_svc,
         web_fetch: &cfg.web_fetch,
+        security: &cfg.security,
+        mindmap: &mindmap,
+        vault: &vault_service,
+        vision: &vision_service,
     };
     let tool = tools::fetch_tool::FetchUrlTool;
     let input = json!({ "url": body.url });
@@ -1435,6 +1877,23 @@ async fn audit_config_post(
     HttpResponse::Ok().json(json!({ "ok": true }))
 }
 
+async fn security_config_get(config: web::Data<Mutex<AppConfig>>) -> HttpResponse {
+    let cfg = config.lock().unwrap();
+    HttpResponse::Ok().json(&cfg.security)
+}
+
+async fn security_config_post(
+    body: web::Json<SecurityConfig>,
+    config: web::Data<Mutex<AppConfig>>,
+) -> HttpResponse {
+    let mut cfg = config.lock().unwrap();
+    cfg.security = body.into_inner();
+    if let Err(e) = cfg.security.save() {
+        return HttpResponse::InternalServerError().json(json!({ "error": e }));
+    }
+    HttpResponse::Ok().json(json!({ "ok": true }))
+}
+
 async fn inference_handler(
     req: web::Json<InferenceRequest>,
     model_service: web::Data<Box<dyn ModelInferenceService>>,
@@ -1471,6 +1930,30 @@ async fn inference_handler(
     })
 }
 
+async fn spellcheck_handler(
+    req: web::Json<SpellcheckRequest>,
+    model_service: web::Data<Box<dyn ModelInferenceService>>,
+) -> HttpResponse {
+    let prompt = format!(
+        "Fix only spelling and grammar errors in the following text. Do not change meaning, style, or formatting. Return ONLY the corrected text, with no explanations or markdown:\n\n{}",
+        req.text
+    );
+    let infer_req = InferenceRequest {
+        prompt,
+        user_context: String::new(),
+        mindmap_payload: serde_json::Value::Null,
+        image_archives: Vec::new(),
+        other_instances: serde_json::Value::Null,
+        model_params: serde_json::json!({"temperature": 0.1}),
+        ai_name: "Avalon".to_string(),
+        history: Vec::new(),
+    };
+    match model_service.infer(&infer_req).await {
+        Ok(corrected) => HttpResponse::Ok().json(SpellcheckResponse { corrected }),
+        Err(e) => HttpResponse::InternalServerError().json(json!({ "error": e })),
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Main
 // ═════════════════════════════════════════════════════════════════════════════
@@ -1487,9 +1970,54 @@ async fn main() -> std::io::Result<()> {
     registry.register(Box::new(tools::fetch_tool::FetchUrlTool));
     registry.register(Box::new(tools::remote_mindmap_tool::RemoteMindMapTool));
     registry.register(Box::new(tools::web_scrape_tool::WebScrapeTool));
+    registry.register(Box::new(tools::video_tool::VideoAnalyzeTool));
 
     let all_tool_names: Vec<String> = registry.names().iter().map(|s| s.to_string()).collect();
     let mut config = AppConfig::new();
+
+    // Initialize SQLite database (MindVault, VisionVault, Agents)
+    let project_root = std::env::current_exe()
+        .ok()
+        .and_then(|p| {
+            let mut path = p;
+            path.pop(); path.pop(); path.pop();
+            Some(path)
+        })
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let vault_db = match VaultDb::open(&project_root) {
+        Ok(db) => {
+            println!("[Avalon] SQLite vault database initialized");
+            Arc::new(Mutex::new(db))
+        }
+        Err(e) => {
+            eprintln!("[Avalon] Fatal: Failed to initialize SQLite vault database: {}", e);
+            std::process::exit(1);
+        }
+    };
+    let vault_db_data = web::Data::new(vault_db.clone());
+
+    // Initialize Vault, Vision, and Agent services
+    let vault_service = Arc::new(Mutex::new(vault::VaultService::new(vault_db.clone())));
+    let vision_service = Arc::new(Mutex::new(vision::VisionService::new(vault_db.clone())));
+    let agent_registry = Arc::new(Mutex::new(agents::AgentRegistry::new(vault_db.clone())));
+
+    // Seed built-in agents on first startup (idempotent)
+    if let Err(e) = agent_registry.lock().unwrap().seed_builtin_agents() {
+        eprintln!("Warning: failed to seed built-in agents: {}", e);
+    }
+
+    // Register vault tools
+    registry.register(Box::new(tools::vault_search_tool::VaultSearchTool::new(vault_service.clone())));
+    registry.register(Box::new(tools::vault_read_tool::VaultReadTool::new(vault_service.clone())));
+
+    // Register vision tools
+    registry.register(Box::new(tools::vision_search_tool::VisionSearchTool::new(vision_service.clone())));
+    registry.register(Box::new(tools::vision_read_tool::VisionReadTool::new(vision_service.clone())));
+
+    // Register agent tools
+    registry.register(Box::new(tools::dispatch_agent_tool::DispatchAgentTool::new(agent_registry.clone())));
+    registry.register(Box::new(tools::board_post_tool::BoardPostTool::new(agent_registry.clone())));
+    registry.register(Box::new(tools::board_read_tool::BoardReadTool::new(agent_registry.clone())));
     // Migrate old tool names
     config.active_tools = config.active_tools.iter().map(|name| {
         if name == "build_mindmap" { "mindmap".to_string() } else { name.clone() }
@@ -1510,7 +2038,7 @@ async fn main() -> std::io::Result<()> {
     let tools_list = active_tools_list.join(", ");
     let tools_description = format!("Available tools: {}.\n\nUse get_fs_config to read the current file system limiter rules so you can explain to the user exactly which paths are allowed or denied. The config file itself (.avalon_fs.json) is always readable for transparency. All file operations are gated by the FileSystem Limiter. If a path is blocked, explain why using the current rules rather than asking the user to manually edit the config.\n\nUse fetch_url to download content from a public URL. Supports plain text, images (returned as base64), and PDFs (text is safely extracted as plain text using a parser — no scripts or embedded objects are executed). Respects domain allow-lists, size limits, and timeouts configured in Settings > Web Fetch. Only activate this tool if the user explicitly asks you to read a remote file, image, or document.\n\nUse remote_mindmap to download an entire public GitHub repository as a zip, build a structural graph from it, merge it with the local mindmap, then delete the temporary download. Max 25 MB. This is useful for comparing your local project with an open-source dependency or reference implementation.
 
-Use web_scrape to recursively scrape a website starting from a URL, extracting text and image references up to the configured max depth. Respects robots.txt, rate limits, and domain restrictions.\n\nWhen the user asks you to research, learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
+Use web_scrape to recursively scrape a website starting from a URL, extracting text and image references up to the configured max depth. Respects robots.txt, rate limits, and domain restrictions.\n\nUse analyze_video to process a local video file. It extracts metadata (duration, resolution, codec, fps), keyframes at regular intervals as base64 images, and any embedded subtitle track as transcript. Requires ffmpeg to be installed. The user can optionally specify interval_seconds (how many seconds between frames, default 30) and max_frames (default 20). This is useful for summarizing video content, reviewing recordings, or analyzing screen captures.\n\nUse vault_search to query the MindVault full-text index for previously ingested documents, PDFs, or web-scraped text. Use vault_read to retrieve the full content of a specific document by its ID. These tools let you reference stored knowledge without re-fetching external sources.\n\nUse vision_search to query the VisionVault for images by description or tags. Use vision_read to retrieve metadata for a specific image by ID. These tools are useful when the user refers to images they have previously loaded or ingested into the system.\n\nUse dispatch_agent to assign a task to an agent. The agent will be dispatched with a pending status and can only use tools in its whitelist. Use board_post and board_read to communicate with an active agent dispatch via its message board.\n\nWhen the user asks you to learn, look through, explore, investigate, study, analyze, understand, get familiar with, scan, browse, examine, review, survey, map out, or get an overview of a codebase or project, you should FIRST use mindmap to get a structural understanding of the files and their relationships. Then read the most relevant files before answering.", tools_list);
 
     let model_service: Box<dyn ModelInferenceService> = match HttpModelService::new() {
         Ok(mut svc) => {
@@ -1558,6 +2086,10 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             .app_data(fs_data.clone())
             .app_data(registry_data.clone())
             .app_data(mindmap_data.clone())
+            .app_data(vault_db_data.clone())
+            .app_data(vault_service.clone())
+            .app_data(vision_service.clone())
+            .app_data(agent_registry.clone())
             // Legacy endpoint
             .service(web::resource("/v1/infer").route(web::post().to(inference_handler)))
             // GUI endpoints
@@ -1569,6 +2101,7 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
             )
             .service(web::resource("/api/preload").route(web::get().to(preload_model)))
             .service(web::resource("/api/chat").route(web::get().to(chat_handler)))
+            .service(web::resource("/api/spellcheck").route(web::post().to(spellcheck_handler)))
             .service(web::resource("/api/debug").route(web::get().to(get_debug)))
             .service(web::resource("/api/debug/clear").route(web::post().to(clear_debug)))
             .service(web::resource("/api/debug/save").route(web::post().to(save_debug)))
@@ -1587,6 +2120,9 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
                     .route(web::post().to(set_ai_name))
             )
             .service(web::resource("/api/mindmap").route(web::get().to(get_mindmap)))
+            .service(web::resource("/api/mindmap/remote").route(web::get().to(get_remote_mindmap)))
+            .service(web::resource("/api/mindmap/merge").route(web::post().to(merge_remote_mindmap)))
+            .service(web::resource("/api/mindmap/remote/clear").route(web::post().to(clear_remote_mindmap)))
             // File system endpoints
             .service(web::resource("/api/fs/read").route(web::post().to(fs_read)))
             .service(web::resource("/api/fs/image").route(web::post().to(fs_image)))
@@ -1608,7 +2144,29 @@ Use web_scrape to recursively scrape a website starting from a URL, extracting t
                     .route(web::get().to(audit_config_get))
                     .route(web::post().to(audit_config_post))
             )
+            .service(
+                web::resource("/api/security/config")
+                    .route(web::get().to(security_config_get))
+                    .route(web::post().to(security_config_post))
+            )
             .service(web::resource("/api/fetch").route(web::post().to(direct_fetch)))
+            .service(web::resource("/api/vault/search").route(web::get().to(vault_search)))
+            .service(web::resource("/api/vault/document/{id}").route(web::get().to(vault_get_document)))
+            .service(web::resource("/api/vault/document/{id}").route(web::delete().to(vault_delete_document)))
+            .service(web::resource("/api/vision/search").route(web::get().to(vision_search)))
+            .service(web::resource("/api/vision/image/{id}").route(web::get().to(vision_get_image)))
+            .service(web::resource("/api/vision/confirm/{id}").route(web::post().to(vision_confirm_image)))
+            .service(web::resource("/api/vision/image/{id}").route(web::delete().to(vision_delete_image)))
+            .service(web::resource("/api/agents").route(web::get().to(agent_list)))
+            .service(web::resource("/api/agents").route(web::post().to(agent_create)))
+            .service(web::resource("/api/agents/{name}").route(web::get().to(agent_get)))
+            .service(web::resource("/api/agents/{name}").route(web::post().to(agent_update)))
+            .service(web::resource("/api/agents/{name}").route(web::delete().to(agent_delete)))
+            .service(web::resource("/api/agents/dispatch").route(web::post().to(agent_dispatch)))
+            .service(web::resource("/api/agents/dispatch/{id}").route(web::get().to(agent_dispatch_get)))
+            .service(web::resource("/api/agents/dispatch/{id}/cancel").route(web::post().to(agent_dispatch_cancel)))
+            .service(web::resource("/api/agents/dispatch/{id}/board").route(web::get().to(agent_board_get)))
+            .service(web::resource("/api/agents/dispatch/{id}/board").route(web::post().to(agent_board_post)))
     })
     .bind("127.0.0.1:8080")?
     .run()

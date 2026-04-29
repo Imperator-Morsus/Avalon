@@ -40,7 +40,27 @@ impl Tool for WriteFileTool {
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
         let content = input.get("content").and_then(|v| v.as_str()).ok_or("Missing content")?;
+        if ctx.security.require_write_permission {
+            return Ok(serde_json::json!({
+                "success": false,
+                "path": path,
+                "content": null,
+                "error": "Write operations require explicit permission. This is enforced by the Security settings (require_write_permission). You can approve this in Settings > Security or ask the user to disable the write permission gate.",
+                "entries": null
+            }));
+        }
         let result = ctx.fs.write_file(path, content);
+
+        // Auto-ingest into MindVault if write succeeded
+        if result.success {
+            let normalized = crate::fs::normalize_path(path);
+            let _ = ctx.vault.lock().unwrap().ingest_file(
+                std::path::Path::new(&normalized),
+                None,
+                None,
+            );
+        }
+
         serde_json::to_value(result).map_err(|e| e.to_string())
     }
 }
@@ -78,6 +98,15 @@ impl Tool for DeleteFileTool {
 
     async fn execute(&self, input: serde_json::Value, ctx: &ToolContext<'_>) -> Result<serde_json::Value, String> {
         let path = input.get("path").and_then(|v| v.as_str()).ok_or("Missing path")?;
+        if ctx.security.require_delete_permission {
+            return Ok(serde_json::json!({
+                "success": false,
+                "path": path,
+                "content": null,
+                "error": "Delete operations require explicit permission. This is enforced by the Security settings (require_delete_permission). You can approve this in Settings > Security or ask the user to disable the delete permission gate.",
+                "entries": null
+            }));
+        }
         let result = ctx.fs.delete_file(path);
         serde_json::to_value(result).map_err(|e| e.to_string())
     }

@@ -58,6 +58,8 @@ impl Tool for WriteFileTool {
                 std::path::Path::new(&normalized),
                 None,
                 None,
+                "Public",
+                None,
             );
         }
 

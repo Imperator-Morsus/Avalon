@@ -220,7 +220,7 @@ impl Tool for WebScrapeTool {
                 .vault
                 .lock()
                 .unwrap()
-                .ingest_text(&url, Some(&title), &text, "text");
+                .ingest_text(&url, Some(&title), &text, "text", "Public", None);
 
             if depth < max_depth {
                 let links = extract_links(&html, &parsed);

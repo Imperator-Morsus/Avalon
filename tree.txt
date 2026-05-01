@@ -1,0 +1,19 @@
+.
+  .claude
+  .git
+  Docs
+  archive
+    audit
+  client
+    api
+    contracts
+    node_modules
+    ui
+  logs
+    audit
+      active
+      warm
+    debug
+  src
+    tools
+  target

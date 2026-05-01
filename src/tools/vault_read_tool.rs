@@ -35,24 +35,50 @@ impl Tool for VaultReadTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext<'_>,
+        ctx: &ToolContext<'_>,
     ) -> Result<serde_json::Value, String> {
         let id = input
             .get("id")
             .and_then(|v| v.as_i64())
             .ok_or("Missing 'id' argument. Provide the document ID from vault_search.")?;
 
-        match self.vault.lock().unwrap().get(id)? {
-            Some(doc) => Ok(json!({
-                "id": doc.id,
-                "source_path": doc.source_path,
-                "title": doc.title,
-                "content_type": doc.content_type,
-                "content": doc.content,
-                "size_bytes": doc.size_bytes,
-                "ingested_at": doc.ingested_at,
-            })),
-            None => Err(format!("Document {} not found in vault.", id)),
-        }
+        let doc = match self.vault.lock().unwrap().get_filtered(id, &ctx.permission_level) {
+            Ok(Some(d)) => d,
+            Ok(None) => {
+                let e = "Access denied or document not found.".to_string();
+                ctx.audit("vault_read_error", json!({
+                    "id": id,
+                    "error": &e,
+                    "actor": ctx.actor,
+                    "session_id": ctx.session_id,
+                }));
+                return Err(e);
+            }
+            Err(e) => {
+                ctx.audit("vault_read_error", json!({
+                    "id": id,
+                    "error": &e,
+                    "actor": ctx.actor,
+                    "session_id": ctx.session_id,
+                }));
+                return Err(e);
+            }
+        };
+        ctx.audit("vault_read", json!({
+            "id": doc.id,
+            "source_path": doc.source_path,
+            "actor": ctx.actor,
+            "session_id": ctx.session_id,
+        }));
+        Ok(json!({
+            "id": doc.id,
+            "source_path": doc.source_path,
+            "title": doc.title,
+            "content_type": doc.content_type,
+            "content": doc.content,
+            "size_bytes": doc.size_bytes,
+            "ingested_at": doc.ingested_at,
+            "access_tier": doc.access_tier,
+        }))
     }
 }

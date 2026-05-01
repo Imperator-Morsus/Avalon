@@ -105,3 +105,46 @@ impl AgentWorker for HttpImageWorker {
         Err("HttpImageWorker not yet implemented".to_string())
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Astra — Autonomous Vault Maintenance Agent
+// Astra runs as a background loop in main.rs, not as a request-response worker.
+// This stub exists so Astra can be registered in the agent registry.
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Astra is Avalon\'s autonomous librarian agent. She runs a background loop
+/// (see `astra_main_loop` in main.rs) that auto-ingests files, extracts concepts,
+/// and detects contradictions. The dispatch() method returns an error because
+/// Astra does not process synchronous task dispatches — she operates autonomously.
+pub struct AstraWorker;
+
+impl AstraWorker {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+#[async_trait::async_trait]
+impl AgentWorker for AstraWorker {
+    fn name(&self) -> &str {
+        "astra"
+    }
+
+    fn description(&self) -> &str {
+        "Avalon\'s autonomous librarian — maintains The Vault in the background. Auto-ingests files, extracts concepts, and detects contradictions. Does not process task dispatches."
+    }
+
+    async fn start(&mut self) -> Result<(), String> {
+        // Astra has no separate process to start — all work happens in the
+        // background loop spawned in main.rs. This is a no-op.
+        Ok(())
+    }
+
+    async fn stop(&mut self) -> Result<(), String> {
+        Ok(())
+    }
+
+    async fn dispatch(&self, _task: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("Astra does not process task dispatches. She operates autonomously as a background loop.".to_string())
+    }
+}

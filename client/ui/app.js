@@ -5,11 +5,14 @@ let history = [];
 let model = '';
 let aiName = '';
 let pendingPermission = null;
+window.currentUser = null;
+window.isAuthenticated = false;
 
 // DOM
 const chatHistory = document.getElementById('chatHistory');
 const userInput = document.getElementById('userInput');
 const sendBtn = document.getElementById('sendBtn');
+const stopBtn = document.getElementById('stopBtn');
 const debugPanel = document.getElementById('debugPanel');
 const debugToggle = document.getElementById('debugToggle');
 const debugContent = document.getElementById('debugContent');
@@ -22,6 +25,8 @@ const preloadBtn = document.getElementById('preloadBtn');
 const statusDot = document.getElementById('statusDot');
 const statusText = document.getElementById('statusText');
 const iterCount = document.getElementById('iterCount');
+const reconnectBtn = document.getElementById('reconnectBtn');
+const restartBtn = document.getElementById('restartBtn');
 
 // Debug panel
 function ts() {
@@ -116,10 +121,41 @@ const mindmapOverlay = document.getElementById('mindmapOverlay');
 const mindmapSvg = document.getElementById('mindmapSvg');
 const mindmapContainer = document.getElementById('mindmapContainer');
 
-async function renderMindmap(data) {
+// Graph state for Phase 4
+let graphState = {
+  scale: 1,
+  translateX: 0,
+  translateY: 0,
+  isDragging: false,
+  dragStartX: 0,
+  dragStartY: 0,
+  selectedNodeId: null,
+  collapsedNodeIds: new Set(),
+  theme: 'dark',
+  lastData: null,
+  lastSvg: null,
+  lastContainer: null,
+};
+
+async function renderMindmap(data, targetSvg, targetContainer) {
   const ns = 'http://www.w3.org/2000/svg';
-  const svg = mindmapSvg;
+  const svg = targetSvg || mindmapSvg;
+  const container = targetContainer || mindmapContainer;
+  const isVaultGraph = container.id === 'vaultGraphContainer';
+  const canvasWrapper = container.querySelector('.graph-canvas-wrapper') || container;
+  const tooltip = container.querySelector('.graph-tooltip');
+  const detailPanel = container.querySelector('.graph-detail-panel');
+  const sidebar = container.querySelector('.graph-sidebar');
+
+  graphState.lastData = data;
+  graphState.lastSvg = svg;
+  graphState.lastContainer = container;
+
   svg.innerHTML = '';
+  if (isVaultGraph) {
+    graphState.selectedNodeId = null;
+    if (detailPanel) detailPanel.classList.add('hidden');
+  }
 
   if (!data || !data.nodes || data.nodes.length === 0) {
     const text = document.createElementNS(ns, 'text');
@@ -128,54 +164,80 @@ async function renderMindmap(data) {
     text.setAttribute('text-anchor', 'middle');
     text.setAttribute('fill', 'var(--muted)');
     text.setAttribute('font-size', '14');
-    text.textContent = 'No mindmap data. Click Refresh to build.';
+    text.textContent = 'No graph data available.';
     svg.appendChild(text);
     return;
   }
 
-  const width = mindmapContainer.clientWidth;
-  const height = mindmapContainer.clientHeight;
+  const overlay = svg.closest('.mindmap-overlay');
+  const wasHidden = overlay && overlay.classList.contains('hidden');
+  if (wasHidden) overlay.classList.remove('hidden');
+
+  const width = canvasWrapper.clientWidth || container.clientWidth || window.innerWidth;
+  const height = canvasWrapper.clientHeight || container.clientHeight || window.innerHeight;
   svg.setAttribute('viewBox', `0 0 ${width} ${height}`);
 
+  // Apply theme class
+  container.classList.remove('graph-theme-light', 'graph-theme-dark', 'graph-theme-colorful');
+  container.classList.add(`graph-theme-${graphState.theme}`);
+
+  // Build data structures
   const nodes = data.nodes.map(n => ({ ...n, x: width / 2 + (Math.random() - 0.5) * 200, y: height / 2 + (Math.random() - 0.5) * 200 }));
   const nodeMap = new Map(nodes.map(n => [n.id, n]));
   const edges = data.edges.map(e => ({ ...e, source: nodeMap.get(e.source), target: nodeMap.get(e.target) })).filter(e => e.source && e.target);
 
-  // Pre-fetch images
-  const imageNodes = nodes.filter(n => n.node_type === 'image');
-  const imagePromises = imageNodes.map(async n => {
-    const imgPath = n.metadata?.image_path || n.id;
-    try {
-      const res = await fetch(`${API_BASE}/api/fs/image`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ path: imgPath })
-      });
-      const imgData = await res.json();
-      if (imgData.success && imgData.base64) {
-        if (imgData.warnings && imgData.warnings.length > 0) {
-          addDebugLine(`[${ts()}] IMAGE WARNING ${n.label}: ${imgData.warnings.join(', ')}`, 'error');
-        }
-        return { id: n.id, base64: imgData.base64, mime: imgData.mime_type };
-      }
-    } catch(e) {}
-    return { id: n.id, base64: null, mime: null };
-  });
-  const imageResults = await Promise.all(imagePromises);
-  const imageMap = new Map(imageResults.map(r => [r.id, r]));
+  // Build tree structure for expand/collapse
+  const childrenMap = new Map();
+  for (const e of edges) {
+    if (e.relation === 'contains' || e.label === 'contains') {
+      if (!childrenMap.has(e.source.id)) childrenMap.set(e.source.id, []);
+      childrenMap.get(e.source.id).push(e.target.id);
+    }
+  }
+  const parentMap = new Map();
+  for (const e of edges) {
+    if (e.relation === 'contains' || e.label === 'contains') {
+      parentMap.set(e.target.id, e.source.id);
+    }
+  }
 
-  // Force-directed simulation (non-blocking, chunked)
-  const k = Math.sqrt((width * height) / nodes.length) * 0.8;
-  const iterations = 300;
-  const chunkSize = 30; // iterations per frame to keep UI responsive
+  // Determine visible nodes
+  const visibleNodeIds = new Set();
+  const rootId = data.root;
+
+  function addVisible(nodeId, parentVisible) {
+    if (!nodeMap.has(nodeId)) return;
+    if (parentVisible) visibleNodeIds.add(nodeId);
+    if (graphState.collapsedNodeIds.has(nodeId)) return;
+    const children = childrenMap.get(nodeId) || [];
+    for (const childId of children) {
+      addVisible(childId, parentVisible);
+    }
+  }
+
+  addVisible(rootId, true);
+  // Also add orphan nodes (no parent)
+  for (const n of nodes) {
+    if (!parentMap.has(n.id) && n.id !== rootId) {
+      visibleNodeIds.add(n.id);
+    }
+  }
+
+  const visibleNodes = nodes.filter(n => visibleNodeIds.has(n.id));
+  const visibleNodeIdSet = new Set(visibleNodes.map(n => n.id));
+  const visibleEdges = edges.filter(e => visibleNodeIdSet.has(e.source.id) && visibleNodeIdSet.has(e.target.id));
+
+  // Force-directed simulation
+  const k = Math.sqrt((width * height) / Math.max(visibleNodes.length, 1)) * 0.8;
+  const iterations = 200;
+  const chunkSize = 30;
 
   function runSimStep(start) {
     const end = Math.min(start + chunkSize, iterations);
     for (let i = start; i < end; i++) {
-      // Repulsion
-      for (let a = 0; a < nodes.length; a++) {
-        for (let b = a + 1; b < nodes.length; b++) {
-          const na = nodes[a], nb = nodes[b];
+      for (let a = 0; a < visibleNodes.length; a++) {
+        for (let b = a + 1; b < visibleNodes.length; b++) {
+          const na = visibleNodes[a], nb = visibleNodes[b];
           let dx = na.x - nb.x, dy = na.y - nb.y;
           let dist = Math.sqrt(dx * dx + dy * dy) || 1;
           const force = (k * k) / dist;
@@ -185,8 +247,7 @@ async function renderMindmap(data) {
           nb.x -= fx; nb.y -= fy;
         }
       }
-      // Attraction
-      for (const e of edges) {
+      for (const e of visibleEdges) {
         let dx = e.target.x - e.source.x, dy = e.target.y - e.source.y;
         let dist = Math.sqrt(dx * dx + dy * dy) || 1;
         const force = (dist * dist) / k * 0.02;
@@ -195,8 +256,7 @@ async function renderMindmap(data) {
         e.source.x += fx; e.source.y += fy;
         e.target.x -= fx; e.target.y -= fy;
       }
-      // Center gravity
-      for (const n of nodes) {
+      for (const n of visibleNodes) {
         n.x += (width / 2 - n.x) * 0.01;
         n.y += (height / 2 - n.y) * 0.01;
       }
@@ -209,100 +269,445 @@ async function renderMindmap(data) {
   }
 
   function finishRender() {
-    // Find bounds and scale to fit
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of nodes) {
+    for (const n of visibleNodes) {
       minX = Math.min(minX, n.x); minY = Math.min(minY, n.y);
       maxX = Math.max(maxX, n.x); maxY = Math.max(maxY, n.y);
     }
     const pad = 60;
     const graphW = maxX - minX + pad * 2;
     const graphH = maxY - minY + pad * 2;
-    const scale = Math.min(width / graphW, height / graphH, 1.2);
-    const offsetX = (width - (maxX - minX) * scale) / 2 - minX * scale;
-    const offsetY = (height - (maxY - minY) * scale) / 2 - minY * scale;
-    drawScene(offsetX, offsetY, scale);
+    const fitScale = Math.min(width / graphW, height / graphH, 1.2);
+    const offsetX = (width - (maxX - minX) * fitScale) / 2 - minX * fitScale;
+    const offsetY = (height - (maxY - minY) * fitScale) / 2 - minY * fitScale;
+
+    // Restore previous transform if switching tabs, else fit
+    if (graphState.translateX === 0 && graphState.translateY === 0 && graphState.scale === 1) {
+      graphState.scale = fitScale;
+      graphState.translateX = offsetX;
+      graphState.translateY = offsetY;
+    }
+    drawScene(graphState.translateX, graphState.translateY, graphState.scale);
   }
 
-  function drawScene(offsetX, offsetY, scale) {
+  function drawScene(tx, ty, sc) {
+    svg.innerHTML = '';
+    const g = document.createElementNS(ns, 'g');
+    g.setAttribute('transform', `translate(${tx},${ty}) scale(${sc})`);
 
-  const g = document.createElementNS(ns, 'g');
-  g.setAttribute('transform', `translate(${offsetX},${offsetY}) scale(${scale})`);
-
-  // Edges
-  for (const e of edges) {
-    const line = document.createElementNS(ns, 'line');
-    line.setAttribute('x1', e.source.x);
-    line.setAttribute('y1', e.source.y);
-    line.setAttribute('x2', e.target.x);
-    line.setAttribute('y2', e.target.y);
-    line.setAttribute('class', 'mindmap-edge');
-    g.appendChild(line);
-  }
-
-  // Nodes
-  const rootId = data.root;
-  for (const n of nodes) {
-    const nodeG = document.createElementNS(ns, 'g');
-    nodeG.setAttribute('class', 'mindmap-node');
-    nodeG.setAttribute('transform', `translate(${n.x},${n.y})`);
-
-    const isRoot = n.id === rootId;
-    const isDir = n.node_type === 'dir';
-    const isImage = n.node_type === 'image';
-    const r = isRoot ? 14 : isDir ? 10 : 6;
-
-    if (isImage) {
-      const imgInfo = imageMap.get(n.id);
-      if (imgInfo && imgInfo.base64) {
-        const imgSize = 24;
-        const imageEl = document.createElementNS(ns, 'image');
-        imageEl.setAttribute('x', -imgSize / 2);
-        imageEl.setAttribute('y', -imgSize / 2);
-        imageEl.setAttribute('width', imgSize);
-        imageEl.setAttribute('height', imgSize);
-        imageEl.setAttribute('href', `data:${imgInfo.mime};base64,${imgInfo.base64}`);
-        imageEl.setAttribute('preserveAspectRatio', 'xMidYMid slice');
-        imageEl.style.clipPath = 'circle(50%)';
-        nodeG.appendChild(imageEl);
-      } else {
-        // Fallback: image placeholder circle
-        const circle = document.createElementNS(ns, 'circle');
-        circle.setAttribute('r', r);
-        circle.setAttribute('fill', '#c084fc');
-        nodeG.appendChild(circle);
-      }
-    } else if (isDir || isRoot) {
-      const rect = document.createElementNS(ns, 'rect');
-      rect.setAttribute('x', -r * 1.6);
-      rect.setAttribute('y', -r);
-      rect.setAttribute('width', r * 3.2);
-      rect.setAttribute('height', r * 2);
-      rect.setAttribute('rx', r);
-      rect.setAttribute('fill', isRoot ? '#e67e22' : '#5a8dee');
-      nodeG.appendChild(rect);
-    } else {
-      const circle = document.createElementNS(ns, 'circle');
-      circle.setAttribute('r', r);
-      circle.setAttribute('fill', '#8fd460');
-      nodeG.appendChild(circle);
+    // Edges
+    for (const e of visibleEdges) {
+      const line = document.createElementNS(ns, 'line');
+      line.setAttribute('x1', e.source.x);
+      line.setAttribute('y1', e.source.y);
+      line.setAttribute('x2', e.target.x);
+      line.setAttribute('y2', e.target.y);
+      line.setAttribute('class', 'mindmap-edge');
+      g.appendChild(line);
     }
 
-    const text = document.createElementNS(ns, 'text');
-    text.setAttribute('text-anchor', 'middle');
-    text.setAttribute('dy', isDir || isRoot ? '0.35em' : '-0.8em');
-    text.textContent = n.label;
-    nodeG.appendChild(text);
+    // Nodes
+    for (const n of visibleNodes) {
+      const nodeG = document.createElementNS(ns, 'g');
+      nodeG.setAttribute('class', `mindmap-node ${n.node_type === 'root' ? 'node-type-root' : n.node_type === 'dir' ? 'node-type-dir' : n.node_type === 'image' ? 'node-type-image' : n.node_type === 'concept' ? 'node-type-concept' : 'node-type-file'}`);
+      nodeG.setAttribute('transform', `translate(${n.x},${n.y})`);
+      nodeG.setAttribute('data-node-id', n.id);
+      if (graphState.selectedNodeId === n.id) nodeG.classList.add('selected');
 
-    g.appendChild(nodeG);
+      const isRoot = n.id === rootId;
+      const isDir = n.node_type === 'dir';
+      const isImage = n.node_type === 'image';
+      const isConcept = n.node_type === 'concept';
+      const r = isRoot ? 14 : isDir ? 10 : 6;
+
+      // Shape
+      if (isDir || isRoot) {
+        const rect = document.createElementNS(ns, 'rect');
+        rect.setAttribute('x', -r * 1.6);
+        rect.setAttribute('y', -r);
+        rect.setAttribute('width', r * 3.2);
+        rect.setAttribute('height', r * 2);
+        rect.setAttribute('rx', r);
+        rect.setAttribute('fill', isRoot ? '#e67e22' : '#5a8dee');
+        nodeG.appendChild(rect);
+      } else {
+        const circle = document.createElementNS(ns, 'circle');
+        circle.setAttribute('r', r);
+        circle.setAttribute('fill', isImage ? '#c084fc' : isConcept ? '#f472b6' : '#8fd460');
+        nodeG.appendChild(circle);
+      }
+
+      // Label
+      const text = document.createElementNS(ns, 'text');
+      text.setAttribute('text-anchor', 'middle');
+      text.setAttribute('dy', isDir || isRoot ? '0.35em' : '-0.8em');
+      text.textContent = n.label;
+      nodeG.appendChild(text);
+
+      // Children indicator (for collapsed nodes with children)
+      const hasChildren = childrenMap.has(n.id) && (childrenMap.get(n.id) || []).length > 0;
+      if (hasChildren) {
+        const indicator = document.createElementNS(ns, 'circle');
+        indicator.setAttribute('class', 'node-children-indicator');
+        indicator.setAttribute('cx', r + 4);
+        indicator.setAttribute('cy', 0);
+        indicator.setAttribute('r', 3);
+        indicator.setAttribute('fill', graphState.collapsedNodeIds.has(n.id) ? '#ef4444' : '#22c55e');
+        indicator.style.display = hasChildren ? 'block' : 'none';
+        nodeG.appendChild(indicator);
+      }
+
+      // Event handlers
+      nodeG.addEventListener('click', (e) => {
+        e.stopPropagation();
+        if (hasChildren) {
+          if (graphState.collapsedNodeIds.has(n.id)) {
+            graphState.collapsedNodeIds.delete(n.id);
+          } else {
+            graphState.collapsedNodeIds.add(n.id);
+          }
+          // Re-render with same transform
+          requestAnimationFrame(() => {
+            renderMindmap(data, svg, container);
+            graphState.translateX = tx;
+            graphState.translateY = ty;
+            graphState.scale = sc;
+            drawScene(tx, ty, sc);
+          });
+        }
+        if (isVaultGraph) {
+          graphState.selectedNodeId = n.id;
+          showNodeDetails(n);
+          // Update selection highlight
+          svg.querySelectorAll('.mindmap-node').forEach(el => el.classList.remove('selected'));
+          nodeG.classList.add('selected');
+        }
+      });
+
+      nodeG.addEventListener('mouseenter', (e) => {
+        if (tooltip) {
+          tooltip.textContent = `${n.label} (${n.node_type})`;
+          tooltip.classList.remove('hidden');
+        }
+      });
+      nodeG.addEventListener('mouseleave', () => {
+        if (tooltip) tooltip.classList.add('hidden');
+      });
+
+      g.appendChild(nodeG);
+    }
+
+    svg.appendChild(g);
+
+    // Update zoom label
+    const zoomLabel = container.querySelector('#graphZoomLabel');
+    if (zoomLabel) zoomLabel.textContent = `${Math.round(sc * 100)}%`;
   }
 
-  svg.appendChild(g);
+  // Zoom and pan handlers
+  function onWheel(e) {
+    e.preventDefault();
+    const rect = svg.getBoundingClientRect();
+    const mx = e.clientX - rect.left;
+    const my = e.clientY - rect.top;
+    const zoomFactor = e.deltaY < 0 ? 1.1 : 0.9;
+    const newScale = Math.max(0.1, Math.min(5, graphState.scale * zoomFactor));
+    const newTx = mx - (mx - graphState.translateX) * (newScale / graphState.scale);
+    const newTy = my - (my - graphState.translateY) * (newScale / graphState.scale);
+    graphState.scale = newScale;
+    graphState.translateX = newTx;
+    graphState.translateY = newTy;
+    drawScene(newTx, newTy, newScale);
   }
 
-  // Start the non-blocking simulation
+  function onMouseDown(e) {
+    if (e.target.closest('.mindmap-node')) return;
+    graphState.isDragging = true;
+    graphState.dragStartX = e.clientX;
+    graphState.dragStartY = e.clientY;
+    svg.style.cursor = 'grabbing';
+  }
+
+  function onMouseMove(e) {
+    if (tooltip && !tooltip.classList.contains('hidden')) {
+      const rect = container.getBoundingClientRect();
+      tooltip.style.left = (e.clientX - rect.left + 12) + 'px';
+      tooltip.style.top = (e.clientY - rect.top + 12) + 'px';
+    }
+    if (!graphState.isDragging) return;
+    const dx = e.clientX - graphState.dragStartX;
+    const dy = e.clientY - graphState.dragStartY;
+    graphState.translateX += dx;
+    graphState.translateY += dy;
+    graphState.dragStartX = e.clientX;
+    graphState.dragStartY = e.clientY;
+    drawScene(graphState.translateX, graphState.translateY, graphState.scale);
+  }
+
+  function onMouseUp() {
+    graphState.isDragging = false;
+    svg.style.cursor = 'grab';
+  }
+
+  function onClickBg(e) {
+    if (e.target === svg || e.target.tagName === 'g') {
+      graphState.selectedNodeId = null;
+      if (detailPanel) detailPanel.classList.add('hidden');
+      svg.querySelectorAll('.mindmap-node').forEach(el => el.classList.remove('selected'));
+    }
+  }
+
+  // Remove old listeners before adding new ones
+  svg.removeEventListener('wheel', onWheel);
+  svg.removeEventListener('mousedown', onMouseDown);
+  svg.removeEventListener('mousemove', onMouseMove);
+  svg.removeEventListener('mouseup', onMouseUp);
+  svg.removeEventListener('mouseleave', onMouseUp);
+  svg.removeEventListener('click', onClickBg);
+
+  svg.addEventListener('wheel', onWheel, { passive: false });
+  svg.addEventListener('mousedown', onMouseDown);
+  svg.addEventListener('mousemove', onMouseMove);
+  svg.addEventListener('mouseup', onMouseUp);
+  svg.addEventListener('mouseleave', onMouseUp);
+  svg.addEventListener('click', onClickBg);
+
+  // Build outline tree
+  if (sidebar && isVaultGraph) {
+    buildOutlineTree(data, sidebar, svg, container);
+  }
+
+  // Start simulation
   runSimStep(0);
 }
+
+function buildOutlineTree(data, sidebar, svg, container) {
+  const tree = sidebar.querySelector('#graphOutlineTree');
+  if (!tree) return;
+  tree.innerHTML = '';
+
+  const nodeMap = new Map(data.nodes.map(n => [n.id, n]));
+  const childrenMap = new Map();
+  for (const e of data.edges) {
+    if (e.relation === 'contains' || e.label === 'contains') {
+      if (!childrenMap.has(e.source)) childrenMap.set(e.source, []);
+      childrenMap.get(e.source).push(e.target);
+    }
+  }
+
+  function renderNode(nodeId, depth) {
+    const node = nodeMap.get(nodeId);
+    if (!node) return;
+    const children = childrenMap.get(nodeId) || [];
+    const hasChildren = children.length > 0;
+    const isCollapsed = graphState.collapsedNodeIds.has(nodeId);
+
+    const row = document.createElement('div');
+    row.className = 'graph-outline-item';
+    row.style.paddingLeft = (8 + depth * 14) + 'px';
+
+    const toggle = document.createElement('span');
+    toggle.className = 'outline-toggle';
+    toggle.textContent = hasChildren ? (isCollapsed ? '+' : '-') : '';
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      if (isCollapsed) graphState.collapsedNodeIds.delete(nodeId);
+      else graphState.collapsedNodeIds.add(nodeId);
+      renderMindmap(data, svg, container);
+    };
+
+    const icon = document.createElement('span');
+    icon.className = 'outline-icon';
+    icon.textContent = node.node_type === 'root' ? '' : node.node_type === 'dir' ? '' : node.node_type === 'image' ? '' : '';
+
+    const label = document.createElement('span');
+    label.textContent = node.label;
+    label.style.overflow = 'hidden';
+    label.style.textOverflow = 'ellipsis';
+
+    row.appendChild(toggle);
+    row.appendChild(icon);
+    row.appendChild(label);
+    row.onclick = () => {
+      graphState.selectedNodeId = nodeId;
+      showNodeDetails(node);
+      tree.querySelectorAll('.graph-outline-item').forEach(el => el.classList.remove('active'));
+      row.classList.add('active');
+      svg.querySelectorAll('.mindmap-node').forEach(el => el.classList.remove('selected'));
+      const sel = svg.querySelector(`[data-node-id="${CSS.escape(nodeId)}"]`);
+      if (sel) sel.classList.add('selected');
+    };
+
+    tree.appendChild(row);
+
+    if (hasChildren && !isCollapsed) {
+      for (const childId of children) {
+        renderNode(childId, depth + 1);
+      }
+    }
+  }
+
+  if (data.root) renderNode(data.root, 0);
+  // Orphans
+  const allChildIds = new Set();
+  for (const [, ids] of childrenMap) ids.forEach(id => allChildIds.add(id));
+  for (const n of data.nodes) {
+    if (!allChildIds.has(n.id) && n.id !== data.root) {
+      renderNode(n.id, 0);
+    }
+  }
+}
+
+function showNodeDetails(node) {
+  const panel = document.getElementById('graphDetailPanel');
+  const title = document.getElementById('graphDetailTitle');
+  const content = document.getElementById('graphDetailContent');
+  if (!panel || !title || !content) return;
+
+  title.textContent = node.label || 'Details';
+
+  const meta = node.metadata || {};
+  const rows = [];
+  rows.push(`<div class="detail-row"><div class="detail-label">Type</div><div class="detail-value">${escapeHtml(node.node_type)}</div></div>`);
+  rows.push(`<div class="detail-row"><div class="detail-label">ID</div><div class="detail-value">${node.id}</div></div>`);
+  if (meta.item_id) rows.push(`<div class="detail-row"><div class="detail-label">Item ID</div><div class="detail-value">${meta.item_id}</div></div>`);
+  if (meta.content_type) rows.push(`<div class="detail-row"><div class="detail-label">Content Type</div><div class="detail-value">${escapeHtml(meta.content_type)}</div></div>`);
+  if (meta.warning) rows.push(`<div class="detail-row"><div class="detail-label">Warning</div><div class="detail-value" style="color:#ef4444">${escapeHtml(meta.warning)}</div></div>`);
+  if (node.source_path) rows.push(`<div class="detail-row"><div class="detail-label">Source</div><div class="detail-value">${escapeHtml(node.source_path)}</div></div>`);
+
+  content.innerHTML = rows.join('');
+  panel.classList.remove('hidden');
+}
+
+// Graph toolbar handlers
+function setupGraphToolbar(container) {
+  const toolbar = container.querySelector('#graphToolbar');
+  if (!toolbar) return;
+
+  toolbar.querySelector('#graphZoomIn')?.addEventListener('click', () => {
+    const svg = graphState.lastSvg;
+    const cont = graphState.lastContainer;
+    if (!svg || !cont) return;
+    const newScale = Math.min(5, graphState.scale * 1.2);
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    graphState.translateX = cx - (cx - graphState.translateX) * (newScale / graphState.scale);
+    graphState.translateY = cy - (cy - graphState.translateY) * (newScale / graphState.scale);
+    graphState.scale = newScale;
+    renderMindmap(graphState.lastData, svg, cont);
+  });
+
+  toolbar.querySelector('#graphZoomOut')?.addEventListener('click', () => {
+    const svg = graphState.lastSvg;
+    const cont = graphState.lastContainer;
+    if (!svg || !cont) return;
+    const newScale = Math.max(0.1, graphState.scale / 1.2);
+    const rect = svg.getBoundingClientRect();
+    const cx = rect.width / 2;
+    const cy = rect.height / 2;
+    graphState.translateX = cx - (cx - graphState.translateX) * (newScale / graphState.scale);
+    graphState.translateY = cy - (cy - graphState.translateY) * (newScale / graphState.scale);
+    graphState.scale = newScale;
+    renderMindmap(graphState.lastData, svg, cont);
+  });
+
+  toolbar.querySelector('#graphFit')?.addEventListener('click', () => {
+    graphState.scale = 1;
+    graphState.translateX = 0;
+    graphState.translateY = 0;
+    if (graphState.lastData) {
+      renderMindmap(graphState.lastData, graphState.lastSvg, graphState.lastContainer);
+    }
+  });
+
+  toolbar.querySelector('#graphReset')?.addEventListener('click', () => {
+    graphState.scale = 1;
+    graphState.translateX = 0;
+    graphState.translateY = 0;
+    graphState.collapsedNodeIds.clear();
+    graphState.selectedNodeId = null;
+    if (graphState.lastData) {
+      renderMindmap(graphState.lastData, graphState.lastSvg, graphState.lastContainer);
+    }
+    document.getElementById('graphDetailPanel')?.classList.add('hidden');
+  });
+
+  toolbar.querySelector('#graphOutlineToggle')?.addEventListener('click', () => {
+    document.getElementById('graphSidebar')?.classList.toggle('hidden');
+  });
+
+  toolbar.querySelector('#graphThemeToggle')?.addEventListener('click', () => {
+    const themes = ['dark', 'light', 'colorful'];
+    const idx = themes.indexOf(graphState.theme);
+    graphState.theme = themes[(idx + 1) % themes.length];
+    if (graphState.lastData) {
+      renderMindmap(graphState.lastData, graphState.lastSvg, graphState.lastContainer);
+    }
+  });
+
+  toolbar.querySelector('#graphExportSvg')?.addEventListener('click', () => {
+    const svg = graphState.lastSvg;
+    if (!svg) return;
+    const serializer = new XMLSerializer();
+    const svgString = serializer.serializeToString(svg);
+    const blob = new Blob([svgString], { type: 'image/svg+xml' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'avalon_graph.svg';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  toolbar.querySelector('#graphExportPng')?.addEventListener('click', () => {
+    const svg = graphState.lastSvg;
+    if (!svg) return;
+    const serializer = new XMLSerializer();
+    const svgString = serializer.serializeToString(svg);
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    const img = new Image();
+    const svgBlob = new Blob([svgString], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(svgBlob);
+    img.onload = () => {
+      canvas.width = img.width * 2;
+      canvas.height = img.height * 2;
+      ctx.drawImage(img, 0, 0);
+      const pngUrl = canvas.toDataURL('image/png');
+      const a = document.createElement('a');
+      a.href = pngUrl;
+      a.download = 'avalon_graph.png';
+      a.click();
+      URL.revokeObjectURL(url);
+    };
+    img.src = url;
+  });
+
+  toolbar.querySelector('#graphExportJson')?.addEventListener('click', () => {
+    if (!graphState.lastData) return;
+    const json = JSON.stringify(graphState.lastData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'avalon_graph.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+}
+
+// Setup detail panel close
+function setupDetailPanel() {
+  document.getElementById('graphDetailClose')?.addEventListener('click', () => {
+    document.getElementById('graphDetailPanel')?.classList.add('hidden');
+    graphState.selectedNodeId = null;
+    document.querySelectorAll('.mindmap-node').forEach(el => el.classList.remove('selected'));
+  });
+}
+
+// Call setup once
+setupDetailPanel();
 
 let mindmapData = null;
 
@@ -321,8 +726,8 @@ async function buildMindmap(show = false) {
     localStorage.setItem('avalon_mindmap', JSON.stringify(mindmapData));
     localStorage.setItem('avalon_mindmap_time', Date.now().toString());
     if (show) {
-      await renderMindmap(mindmapData);
       mindmapOverlay.classList.remove('hidden');
+      await renderMindmap(mindmapData);
     }
     addDebugLine(`[${ts()}] MINDMAP: ${mindmapData.nodes.length} nodes, ${mindmapData.edges.length} edges`, 'turn-end');
   } catch(err) {
@@ -332,9 +737,9 @@ async function buildMindmap(show = false) {
 
 // Header Map button
 document.getElementById('mapBtn').addEventListener('click', async () => {
+  mindmapOverlay.classList.remove('hidden');
   if (mindmapData) {
     await renderMindmap(mindmapData);
-    mindmapOverlay.classList.remove('hidden');
   } else {
     await buildMindmap(true);
   }
@@ -344,9 +749,6 @@ document.getElementById('debugMindMapBtn').addEventListener('click', async (e) =
   e.stopPropagation();
   await buildMindmap(true);
 });
-
-// Auto-build mindmap in background shortly after startup
-setTimeout(() => buildMindmap(false), 3000);
 
 document.getElementById('mindmapCloseBtn').addEventListener('click', () => {
   mindmapOverlay.classList.add('hidden');
@@ -358,21 +760,39 @@ document.getElementById('mindmapCloseBtn').addEventListener('click', () => {
 });
 
 document.getElementById('mindmapResetBtn').addEventListener('click', async () => {
-  if (mindmapData) await renderMindmap(mindmapData);
+  if (!mindmapData) return;
+  graphState.scale = 1;
+  graphState.translateX = 0;
+  graphState.translateY = 0;
+  graphState.collapsedNodeIds.clear();
+  graphState.selectedNodeId = null;
+  await renderMindmap(mindmapData);
 });
 
-function mindmapZoom(delta) {
-  const g = mindmapSvg.querySelector('g');
-  if (!g) return;
-  const transform = g.getAttribute('transform') || '';
-  const scaleMatch = transform.match(/scale\(([^)]+)\)/);
-  let scale = parseFloat(scaleMatch ? scaleMatch[1] : 1);
-  scale = Math.max(0.1, Math.min(scale + delta, 5));
-  g.setAttribute('transform', `translate(${mmTranslateX},${mmTranslateY}) scale(${scale})`);
+function applyMindmapTransform() {
+  // Deprecated: renderMindmap redraws from scratch using graphState
 }
 
-document.getElementById('mindmapZoomInBtn').addEventListener('click', () => mindmapZoom(0.2));
-document.getElementById('mindmapZoomOutBtn').addEventListener('click', () => mindmapZoom(-0.2));
+function mindmapZoomAt(delta, cx, cy) {
+  if (!graphState.lastData) return;
+  const newScale = Math.max(0.1, Math.min(graphState.scale + delta, 5));
+  if (newScale === graphState.scale) return;
+  const worldX = (cx - graphState.translateX) / graphState.scale;
+  const worldY = (cy - graphState.translateY) / graphState.scale;
+  graphState.scale = newScale;
+  graphState.translateX = cx - worldX * graphState.scale;
+  graphState.translateY = cy - worldY * graphState.scale;
+  renderMindmap(graphState.lastData, graphState.lastSvg, graphState.lastContainer);
+}
+
+document.getElementById('mindmapZoomInBtn').addEventListener('click', () => {
+  const rect = mindmapSvg.getBoundingClientRect();
+  mindmapZoomAt(0.2, rect.width / 2, rect.height / 2);
+});
+document.getElementById('mindmapZoomOutBtn').addEventListener('click', () => {
+  const rect = mindmapSvg.getBoundingClientRect();
+  mindmapZoomAt(-0.2, rect.width / 2, rect.height / 2);
+});
 document.getElementById('mindmapRefreshBtn').addEventListener('click', async () => {
   await buildMindmap(true);
 });
@@ -430,9 +850,6 @@ document.getElementById('mindmapClearBtn').addEventListener('click', async () =>
   }
 });
 
-// Auto-refresh mindmap every 5 minutes (background learning)
-setInterval(() => buildMindmap(false), 5 * 60 * 1000);
-
 // Audit panel
 const auditOverlay = document.getElementById('auditOverlay');
 const auditContent = document.getElementById('auditContent');
@@ -472,42 +889,7 @@ document.getElementById('auditRefreshBtn').addEventListener('click', () => {
   loadAuditSessions();
 });
 
-// Pan / zoom for mindmap
-let mmPanning = false, mmStartX = 0, mmStartY = 0, mmTranslateX = 0, mmTranslateY = 0;
-mindmapContainer.addEventListener('mousedown', (e) => {
-  if (e.button !== 0) return;
-  mmPanning = true;
-  mmStartX = e.clientX - mmTranslateX;
-  mmStartY = e.clientY - mmTranslateY;
-  mindmapContainer.style.cursor = 'grabbing';
-});
-window.addEventListener('mousemove', (e) => {
-  if (!mmPanning) return;
-  mmTranslateX = e.clientX - mmStartX;
-  mmTranslateY = e.clientY - mmStartY;
-  const g = mindmapSvg.querySelector('g');
-  if (g) {
-    const transform = g.getAttribute('transform');
-    const scaleMatch = transform.match(/scale\(([^)]+)\)/);
-    const scale = scaleMatch ? scaleMatch[1] : 1;
-    g.setAttribute('transform', `translate(${mmTranslateX},${mmTranslateY}) scale(${scale})`);
-  }
-});
-window.addEventListener('mouseup', () => {
-  mmPanning = false;
-  mindmapContainer.style.cursor = 'grab';
-});
-mindmapContainer.addEventListener('wheel', (e) => {
-  e.preventDefault();
-  const g = mindmapSvg.querySelector('g');
-  if (!g) return;
-  const transform = g.getAttribute('transform');
-  const scaleMatch = transform.match(/scale\(([^)]+)\)/);
-  let scale = parseFloat(scaleMatch ? scaleMatch[1] : 1);
-  scale *= e.deltaY < 0 ? 1.1 : 0.9;
-  scale = Math.max(0.1, Math.min(scale, 5));
-  g.setAttribute('transform', `translate(${mmTranslateX},${mmTranslateY}) scale(${scale})`);
-});
+// Pan / zoom for mindmap is now handled internally by renderMindmap via graphState
 
 // Load models
 async function loadModels() {
@@ -584,6 +966,11 @@ preloadBtn.addEventListener('click', async () => {
 function setStatus(type, text) {
   statusDot.className = 'dot ' + type;
   statusText.textContent = text;
+  if (type === 'error' || text === 'Disconnected' || text === 'Error') {
+    reconnectBtn.classList.remove('hidden');
+  } else {
+    reconnectBtn.classList.add('hidden');
+  }
 }
 
 function setIterations(n) {
@@ -682,7 +1069,7 @@ async function pollDebug() {
 
 function renderDebugEntry(entry) {
   const t = ts();
-  const type = entry.type;
+  const type = entry.entry_type || entry.type;
   const d = entry.data || {};
 
   if (type === 'session_start') {
@@ -741,7 +1128,8 @@ async function sendMessage() {
   if (!text) return;
 
   userInput.value = '';
-  sendBtn.disabled = true;
+  sendBtn.classList.add('hidden');
+  stopBtn.classList.remove('hidden');
   permPanel.classList.remove('visible');
   pendingPermission = null;
 
@@ -795,14 +1183,16 @@ async function sendMessage() {
       // Malformed permission event -- ignore
     }
     showPermission(data.tool, data.input);
-    sendBtn.disabled = true;
+    sendBtn.classList.add('hidden');
+    stopBtn.classList.remove('hidden');
   });
 
   evtSource.addEventListener('error', e => {
     appendMessage('error', 'Connection error -- check that the backend is running.');
     addDebugLine(`[${ts()}] SSE ERROR: ${e.data || 'connection error'}`, 'error');
-    sendBtn.disabled = false;
-    setStatus('ready', 'Error');
+    sendBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    setStatus('error', 'Error');
     evtSource.close();
     evtSource = null;
   });
@@ -811,7 +1201,8 @@ async function sendMessage() {
     addDebugLine(`[${ts()}] DONE -- ${e.data} iterations`, 'turn-end');
     setIterations(parseInt(e.data));
     setStatus('ready', 'Ready');
-    sendBtn.disabled = false;
+    sendBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
     evtSource.close();
     evtSource = null;
     // Store conversation turn in history
@@ -826,8 +1217,9 @@ async function sendMessage() {
   evtSource.onerror = () => {
     appendMessage('error', 'SSE error -- connection lost.');
     addDebugLine(`[${ts()}] SSE ONERROR: connection lost`, 'error');
-    sendBtn.disabled = false;
-    setStatus('ready', 'Disconnected');
+    sendBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+    setStatus('error', 'Disconnected');
     evtSource.close();
     evtSource = null;
   };
@@ -870,7 +1262,6 @@ permApprove.addEventListener('click', async () => {
     body: JSON.stringify({ tool: pendingPermission.tool, allowed: true }),
   });
   permPanel.classList.remove('visible');
-  sendBtn.disabled = false;
   pendingPermission = null;
 });
 
@@ -882,7 +1273,6 @@ permDeny.addEventListener('click', async () => {
     body: JSON.stringify({ tool: pendingPermission.tool, allowed: false }),
   });
   permPanel.classList.remove('visible');
-  sendBtn.disabled = false;
   pendingPermission = null;
 });
 
@@ -895,6 +1285,81 @@ userInput.addEventListener('keydown', e => {
 });
 
 sendBtn.addEventListener('click', sendMessage);
+
+stopBtn.addEventListener('click', async () => {
+  try {
+    await fetch(`${API_BASE}/api/cancel`, { method: 'POST' });
+    if (evtSource) {
+      evtSource.close();
+      evtSource = null;
+    }
+    addDebugLine(`[${ts()}] USER: Stop requested`, 'turn-end');
+    appendMessage('error', 'Stopped by user.');
+    setStatus('ready', 'Ready');
+    sendBtn.classList.remove('hidden');
+    stopBtn.classList.add('hidden');
+  } catch (err) {
+    addDebugLine(`[${ts()}] STOP ERROR: ${err.message}`, 'error');
+  }
+});
+
+reconnectBtn.addEventListener('click', async () => {
+  setStatus('thinking', 'Reconnecting...');
+  try {
+    const res = await fetch(`${API_BASE}/api/about`);
+    if (res.ok) {
+      await loadModels();
+      await loadAiName();
+      await loadTools();
+      setStatus('ready', 'Ready');
+      addDebugLine(`[${ts()}] RECONNECTED`, 'info');
+    } else {
+      throw new Error('Server returned ' + res.status);
+    }
+  } catch (e) {
+    setStatus('error', 'Still disconnected');
+    addDebugLine(`[${ts()}] RECONNECT FAILED: ${e.message}`, 'error');
+  }
+});
+
+restartBtn.addEventListener('click', async () => {
+  if (evtSource) {
+    evtSource.close();
+    evtSource = null;
+  }
+  setStatus('thinking', 'Restarting backend...');
+  addDebugLine(`[${ts()}] RESTARTING BACKEND...`, 'turn-end');
+  if (window.avalon && window.avalon.restartBackend) {
+    window.avalon.restartBackend();
+  } else {
+    addDebugLine(`[${ts()}] RESTART ERROR: Electron IPC not available`, 'error');
+    setStatus('error', 'Restart failed');
+    return;
+  }
+  // Poll for backend to come back up
+  let attempts = 0;
+  const maxAttempts = 30;
+  const interval = setInterval(async () => {
+    attempts++;
+    try {
+      const res = await fetch(`${API_BASE}/api/about`);
+      if (res.ok) {
+        clearInterval(interval);
+        await loadModels();
+        await loadAiName();
+        await loadTools();
+        setStatus('ready', 'Ready');
+        addDebugLine(`[${ts()}] BACKEND RESTARTED`, 'info');
+      }
+    } catch (e) {
+      if (attempts >= maxAttempts) {
+        clearInterval(interval);
+        setStatus('error', 'Restart failed — backend not responding');
+        addDebugLine(`[${ts()}] RESTART FAILED: backend not responding`, 'error');
+      }
+    }
+  }, 500);
+});
 
 // ── Inline right-click spellcheck ──
 const spellMenu = document.getElementById('spellMenu');
@@ -914,43 +1379,58 @@ function getWordAtPoint(textarea, clientX, clientY) {
     return { word: text.substring(selStart, selEnd), start: selStart, end: selEnd };
   }
 
-  // Approximate word under cursor
-  const rect = textarea.getBoundingClientRect();
+  // Mirror div technique: create an invisible element with identical styling
+  // so caretPositionFromPoint works on proportional fonts accurately.
   const style = getComputedStyle(textarea);
-  const padLeft = parseFloat(style.paddingLeft) || 0;
-  const padTop = parseFloat(style.paddingTop) || 0;
-  const lineHeight = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.2;
+  const mirror = document.createElement('div');
+  mirror.style.position = 'fixed';
+  mirror.style.top = '0';
+  mirror.style.left = '0';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.wordWrap = 'break-word';
+  mirror.style.overflowWrap = 'break-word';
+  mirror.style.font = style.font;
+  mirror.style.fontSize = style.fontSize;
+  mirror.style.fontFamily = style.fontFamily;
+  mirror.style.fontWeight = style.fontWeight;
+  mirror.style.lineHeight = style.lineHeight;
+  mirror.style.letterSpacing = style.letterSpacing;
+  mirror.style.padding = style.padding;
+  mirror.style.border = style.border;
+  mirror.style.boxSizing = style.boxSizing;
+  mirror.style.width = style.width;
+  mirror.textContent = text + '​'; // zero-width space ensures accurate end-positioning
+  document.body.appendChild(mirror);
 
-  const relX = clientX - rect.left - padLeft;
-  const relY = clientY - rect.top - padTop;
+  let offset = 0;
+  if (document.caretPositionFromPoint) {
+    const pos = document.caretPositionFromPoint(clientX, clientY);
+    if (pos && pos.offsetNode) {
+      offset = pos.offset;
+    }
+  } else if (document.caretRangeFromPoint) {
+    const range = document.caretRangeFromPoint(clientX, clientY);
+    if (range) {
+      offset = range.startOffset;
+    }
+  }
 
-  const lines = text.split('\n');
-  const lineIndex = Math.max(0, Math.min(lines.length - 1, Math.floor(relY / lineHeight)));
-  const lineText = lines[lineIndex];
+  document.body.removeChild(mirror);
 
-  // Measure average char width with canvas
-  const canvas = document.createElement('canvas');
-  const ctx = canvas.getContext('2d');
-  ctx.font = style.font;
-  const charWidth = ctx.measureText('Mm').width / 2 || parseFloat(style.fontSize) * 0.55;
-
-  const col = Math.max(0, Math.min(lineText.length, Math.round(relX / charWidth)));
+  // Clamp to valid range
+  offset = Math.max(0, Math.min(text.length, offset));
 
   // Expand to word boundaries (letters, digits, apostrophes)
-  let wStart = col;
-  let wEnd = col;
-  while (wStart > 0 && /[\w']/.test(lineText[wStart - 1])) wStart--;
-  while (wEnd < lineText.length && /[\w']/.test(lineText[wEnd])) wEnd++;
+  let wStart = offset;
+  let wEnd = offset;
+  while (wStart > 0 && /[\w']/.test(text[wStart - 1])) wStart--;
+  while (wEnd < text.length && /[\w']/.test(text[wEnd])) wEnd++;
 
-  const word = lineText.substring(wStart, wEnd);
+  const word = text.substring(wStart, wEnd);
   if (!word) return null;
 
-  // Map to global offset
-  let globalStart = 0;
-  for (let i = 0; i < lineIndex; i++) globalStart += lines[i].length + 1;
-  globalStart += wStart;
-
-  return { word, start: globalStart, end: globalStart + word.length };
+  return { word, start: wStart, end: wEnd };
 }
 
 userInput.addEventListener('contextmenu', async (e) => {
@@ -1101,32 +1581,23 @@ let currentVaultTab = 'docs';
 
 async function searchVault(query, type) {
   try {
-    const endpoint = type === 'images' ? 'vision' : 'vault';
-    const res = await fetch(`${API_BASE}/api/${endpoint}/search?q=${encodeURIComponent(query)}&limit=20`);
+    let url = `${API_BASE}/api/vault/search?q=${encodeURIComponent(query)}&limit=20`;
+    if (type === 'images') url += '&content_type=image';
+    const res = await fetch(url);
     const data = await res.json();
-    return data.results || data.images || [];
+    return data.results || data.items || [];
   } catch(err) {
     addDebugLine(`[${ts()}] VAULT SEARCH ERROR: ${err.message}`, 'error');
     return [];
   }
 }
 
-async function getVaultDoc(id) {
+async function getVaultItem(id) {
   try {
-    const res = await fetch(`${API_BASE}/api/vault/document/${id}`);
+    const res = await fetch(`${API_BASE}/api/vault/item/${id}`);
     return await res.json();
   } catch(err) {
     addDebugLine(`[${ts()}] VAULT READ ERROR: ${err.message}`, 'error');
-    return null;
-  }
-}
-
-async function getVaultImage(id) {
-  try {
-    const res = await fetch(`${API_BASE}/api/vision/image/${id}`);
-    return await res.json();
-  } catch(err) {
-    addDebugLine(`[${ts()}] VISION READ ERROR: ${err.message}`, 'error');
     return null;
   }
 }
@@ -1138,18 +1609,21 @@ function renderVaultResults(items, type) {
   }
 
   if (type === 'images') {
-    vaultResults.innerHTML = items.map(img => `
+    vaultResults.innerHTML = items.map(img => {
+      let meta = {};
+      try { if (img.metadata) meta = JSON.parse(img.metadata); } catch(e) {}
+      return `
       <div class="vault-item" onclick="showImageDetail(${img.id})">
         <div class="vault-item-image">
-          <div style="width:64px;height:64px;background:var(--panel2);border-radius:var(--radius);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;">${img.format || 'img'}</div>
+          <div style="width:64px;height:64px;background:var(--panel2);border-radius:var(--radius);display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:0.7rem;">${escapeHtml(img.format || 'img')}</div>
           <div>
             <div class="vault-item-title">${escapeHtml(img.source_path?.split(/[\\/]/).pop() || 'Untitled')}</div>
-            <div class="vault-item-meta">${img.width || '?'}x${img.height || '?'} | ${escapeHtml(img.format || 'unknown')} | ${img.confirmed ? 'Confirmed' : 'Unconfirmed'}</div>
+            <div class="vault-item-meta">${img.width || '?'}x${img.height || '?'} | ${escapeHtml(img.format || 'unknown')} | ${meta.confirmed ? 'Confirmed' : 'Unconfirmed'}</div>
             <div class="vault-item-preview">${escapeHtml(img.description || 'No description')}</div>
           </div>
         </div>
       </div>
-    `).join('');
+    `}).join('');
   } else {
     vaultResults.innerHTML = items.map(doc => `
       <div class="vault-item" onclick="showDocDetail(${doc.id})">
@@ -1162,7 +1636,7 @@ function renderVaultResults(items, type) {
 }
 
 async function showDocDetail(id) {
-  const doc = await getVaultDoc(id);
+  const doc = await getVaultItem(id);
   if (!doc) return;
   vaultResults.innerHTML = `
     <div class="vault-detail">
@@ -1178,18 +1652,20 @@ async function showDocDetail(id) {
 }
 
 async function showImageDetail(id) {
-  const img = await getVaultImage(id);
+  const img = await getVaultItem(id);
   if (!img) return;
+  let meta = {};
+  try { if (img.metadata) meta = JSON.parse(img.metadata); } catch(e) {}
   vaultResults.innerHTML = `
     <div class="vault-detail">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <div class="vault-item-title">${escapeHtml(img.source_path?.split(/[\\/]/).pop() || 'Untitled')}</div>
         <button class="debug-btn" onclick="runVaultSearch()">Back</button>
       </div>
-      <div class="vault-item-meta">${img.width || '?'}x${img.height || '?'} | ${escapeHtml(img.format || 'unknown')} | ${img.confirmed ? 'Confirmed' : 'Unconfirmed'}</div>
+      <div class="vault-item-meta">${img.width || '?'}x${img.height || '?'} | ${escapeHtml(img.format || 'unknown')} | ${meta.confirmed ? 'Confirmed' : 'Unconfirmed'}</div>
       <div class="vault-item-meta">Source: ${escapeHtml(img.source_path)}</div>
       <div class="vault-item-preview" style="margin:10px 0;">${escapeHtml(img.description || 'No description')}</div>
-      ${img.tags ? `<div class="vault-item-meta">Tags: ${escapeHtml(img.tags)}</div>` : ''}
+      ${meta.tags ? `<div class="vault-item-meta">Tags: ${escapeHtml(meta.tags)}</div>` : ''}
     </div>
   `;
 }
@@ -1216,15 +1692,41 @@ document.getElementById('vaultCloseBtn').addEventListener('click', () => {
   vaultOverlay.classList.add('hidden');
 });
 
+const vaultGraphContainer = document.getElementById('vaultGraphContainer');
+const vaultGraphSvg = document.getElementById('vaultGraphSvg');
+const vaultSearchBar = document.getElementById('vaultSearchBar');
+setupGraphToolbar(vaultGraphContainer);
+
+async function renderVaultGraph() {
+  try {
+    const res = await fetch(`${API_BASE}/api/vault/mindmap`);
+    const data = await res.json();
+    await renderMindmap(data, vaultGraphSvg, vaultGraphContainer);
+  } catch(err) {
+    addDebugLine(`[${ts()}] VAULT GRAPH ERROR: ${err.message}`, 'error');
+  }
+}
+
 function switchVaultTab(tab) {
   currentVaultTab = tab;
   document.querySelectorAll('#vaultOverlay .mindmap-tab').forEach(t => t.classList.toggle('active', t.dataset.tab === tab));
   vaultResults.innerHTML = '';
   vaultSearchInput.value = '';
+  if (tab === 'graph') {
+    vaultSearchBar.classList.add('hidden');
+    vaultResults.classList.add('hidden');
+    vaultGraphContainer.classList.remove('hidden');
+    renderVaultGraph();
+  } else {
+    vaultSearchBar.classList.remove('hidden');
+    vaultResults.classList.remove('hidden');
+    vaultGraphContainer.classList.add('hidden');
+  }
 }
 
 document.getElementById('tabVaultDocs').addEventListener('click', () => switchVaultTab('docs'));
 document.getElementById('tabVaultImages').addEventListener('click', () => switchVaultTab('images'));
+document.getElementById('tabVaultGraph').addEventListener('click', () => switchVaultTab('graph'));
 
 // ═════════════════════════════════════════════════════════════════════════════
 // Agent UI
@@ -1524,7 +2026,19 @@ async function renderSettings() {
 
     const pluginsHtml = renderPluginsHtml();
 
+    // Auth status display
+    const authBanner = window.isAuthenticated && window.currentUser
+      ? `<div style="background:#1a2a1a;border:1px solid #2a4a2a;border-radius:8px;padding:10px 14px;margin-bottom:16px;display:flex;align-items:center;gap:10px;">
+           <span style="color:#4ade80;font-size:1rem;">&#x2705;</span>
+           <span style="color:var(--text);flex:1">Logged in as <strong>${escapeHtml(window.currentUser.username)}</strong> (${window.currentUser.role})</span>
+         </div>`
+      : `<div style="background:#2a1a1a;border:1px solid #5a2a2a;border-radius:8px;padding:10px 14px;margin-bottom:16px;">
+           <span style="color:#ef4444;">&#x26A0;</span>
+           <span style="color:var(--text);">You must be logged in to change settings.</span>
+         </div>`;
+
     settingsBody.innerHTML = `
+      ${authBanner}
       <div class="settings-section">
         <div class="settings-section-title">Model</div>
         <div class="settings-row">
@@ -1798,13 +2312,24 @@ async function updateFsMaxSize(val) {
 }
 
 async function saveFsConfig() {
+  if (!window.isAuthenticated) {
+    showLoginOverlay(); return;
+  }
   try {
-    const res = await fetch(`${API_BASE}/api/fs/config`, {
+    const res = await authFetch(`${API_BASE}/api/fs/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(window._fsConfig)
     });
     const data = await res.json();
+    if (res.status === 401) {
+      // Token expired — show login
+      sessionStorage.removeItem('avalon_token');
+      window.currentUser = null;
+      window.isAuthenticated = false;
+      showLoginOverlay();
+      return;
+    }
     const msg = document.getElementById('fsSaveMsg');
     if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
     if (data.ok) setTimeout(() => { const m = document.getElementById('fsSaveMsg'); if (m) m.textContent = ''; }, 2000);
@@ -1813,6 +2338,31 @@ async function saveFsConfig() {
     if (msg) msg.textContent = 'Save failed: ' + e.message;
   }
 }
+
+// Confirm settings (no-op — auth replaces this)
+function confirmSettings() {}
+
+// Lock settings (no-op — auth replaces this)
+function lockSettings() {
+  localStorage.setItem(CONFIRM_KEY, '0');
+  renderSettings();
+}
+
+function isSettingsConfirmed() {
+  return window.isAuthenticated;
+}
+
+function getConfirmRemaining() { return 0; }
+
+// Update countdown display every second if settings panel is open (no-op now)
+setInterval(() => {
+  const countdown = document.getElementById('confirmCountdown');
+  if (countdown && isSettingsConfirmed()) {
+    const rem = getConfirmRemaining();
+    countdown.textContent = rem > 0 ? rem + 's' : 'expired';
+    if (rem <= 0) lockSettings();
+  }
+}, 1000);
 
 async function revokePermission(tool) {
   try {
@@ -1964,13 +2514,27 @@ async function removeDomain(type, index) {
 }
 
 async function saveWebFetchConfig() {
+  if (!window.isAuthenticated) { showLoginOverlay(); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/web/config`, {
+    const res = await authFetch(`${API_BASE}/api/web/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(window._webFetchConfig)
     });
     const data = await res.json();
+    if (res.status === 401) { sessionStorage.removeItem('avalon_token'); window.isAuthenticated = false; showLoginOverlay(); return; }
+    const msg = document.getElementById('webFetchSaveMsg');
+    if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
+    if (data.ok) setTimeout(() => { const m = document.getElementById('webFetchSaveMsg'); if (m) m.textContent = ''; }, 2000);
+  } catch(e) {
+    const msg = document.getElementById('webFetchSaveMsg');
+    if (msg) msg.textContent = 'Save failed: ' + e.message;
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(window._webFetchConfig)
+    });
+    const data = await res.json();
+    if (res.status === 403) { lockSettings(); renderSettings(); return; }
     const msg = document.getElementById('webFetchSaveMsg');
     if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
     if (data.ok) setTimeout(() => { const m = document.getElementById('webFetchSaveMsg'); if (m) m.textContent = ''; }, 2000);
@@ -2019,15 +2583,21 @@ function refreshWebFetchSection() {
 }
 
 async function saveAuditConfig() {
+  if (!window.isAuthenticated) { showLoginOverlay(); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/audit/config`, {
+    const res = await authFetch(`${API_BASE}/api/audit/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(window._auditConfig)
     });
     const data = await res.json();
+    if (res.status === 401) { sessionStorage.removeItem('avalon_token'); window.isAuthenticated = false; showLoginOverlay(); return; }
     const msg = document.getElementById('auditSaveMsg');
     if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
+    if (data.ok) setTimeout(() => { const m = document.getElementById('auditSaveMsg'); if (m) m.textContent = ''; }, 2000);
+  } catch(e) {
+    const msg = document.getElementById('auditSaveMsg');
+    if (msg) msg.textContent = 'Save failed: ' + e.message;
     if (data.ok) setTimeout(() => { const m = document.getElementById('auditSaveMsg'); if (m) m.textContent = ''; }, 2000);
   } catch(e) {
     const msg = document.getElementById('auditSaveMsg');
@@ -2048,13 +2618,15 @@ function toggleAuditCold() {
 }
 
 async function saveSecurityConfig() {
+  if (!window.isAuthenticated) { showLoginOverlay(); return; }
   try {
-    const res = await fetch(`${API_BASE}/api/security/config`, {
+    const res = await authFetch(`${API_BASE}/api/security/config`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(window._securityConfig)
     });
     const data = await res.json();
+    if (res.status === 401) { sessionStorage.removeItem('avalon_token'); window.isAuthenticated = false; showLoginOverlay(); return; }
     const msg = document.getElementById('securitySaveMsg');
     if (msg) msg.textContent = data.ok ? 'Saved.' : ('Error: ' + (data.error || 'Unknown'));
     if (data.ok) setTimeout(() => { const m = document.getElementById('securitySaveMsg'); if (m) m.textContent = ''; }, 2000);
@@ -2083,7 +2655,113 @@ function toggleSettingsExpandable(id) {
 }
 
 // Start
-loadModels();
-loadAiName();
-loadTools();
-setInterval(pollDebug, 100);
+checkAuthAndStart();
+
+async function checkAuthAndStart() {
+  // First check if we have a valid session
+  try {
+    const resp = await fetch(`${API_BASE}/api/auth/me`);
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data.ok && data.user) {
+        window.currentUser = data.user;
+        window.isAuthenticated = true;
+        onAuthSuccess();
+        return;
+      }
+    }
+  } catch(e) {
+    // Backend not ready yet
+  }
+  // No valid session — show login
+  showLoginOverlay();
+}
+
+function onAuthSuccess() {
+  document.getElementById('logoutBtn').style.display = '';
+  loadModels();
+  loadAiName();
+  loadTools();
+  setInterval(pollDebug, 100);
+}
+
+function showLoginOverlay() {
+  document.getElementById('loginOverlay').classList.remove('hidden');
+  document.getElementById('logoutBtn').style.display = 'none';
+}
+
+function hideLoginOverlay() {
+  document.getElementById('loginOverlay').classList.add('hidden');
+}
+
+// Login form handler
+document.getElementById('loginSubmit').addEventListener('click', async () => {
+  const username = document.getElementById('loginUsername').value.trim();
+  const password = document.getElementById('loginPassword').value;
+  const errorEl = document.getElementById('loginError');
+  errorEl.textContent = '';
+
+  if (!username || !password) {
+    errorEl.textContent = 'Please enter username and password';
+    return;
+  }
+
+  try {
+    const resp = await fetch(`${API_BASE}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await resp.json();
+    if (data.ok && data.token) {
+      sessionStorage.setItem('avalon_token', data.token);
+      window.currentUser = data.user;
+      window.isAuthenticated = true;
+      hideLoginOverlay();
+      onAuthSuccess();
+    } else {
+      errorEl.textContent = data.error || 'Login failed';
+    }
+  } catch(e) {
+    errorEl.textContent = 'Connection error: ' + e.message;
+  }
+});
+
+// Enter key on password field
+document.getElementById('loginPassword').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('loginSubmit').click();
+});
+document.getElementById('loginUsername').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('loginPassword').focus();
+});
+
+// Logout button
+document.getElementById('logoutBtn').addEventListener('click', async () => {
+  const token = sessionStorage.getItem('avalon_token');
+  if (token) {
+    try {
+      await fetch(`${API_BASE}/api/auth/logout`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Bearer ' + token
+        }
+      });
+    } catch(e) { /* ignore */ }
+  }
+  sessionStorage.removeItem('avalon_token');
+  window.currentUser = null;
+  window.isAuthenticated = false;
+  showLoginOverlay();
+  // Clear chat too
+  chatHistory.innerHTML = '';
+  history = [];
+});
+
+// authFetch wrapper — adds Authorization header if we have a token
+async function authFetch(url, options = {}) {
+  const token = sessionStorage.getItem('avalon_token');
+  const headers = { ...(options.headers || {}) };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  return fetch(url, { ...options, headers });
+}

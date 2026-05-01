@@ -230,7 +230,7 @@ impl FileSystemService {
             };
         }
 
-        match std::fs::metadata(&path) {
+        let resolved_path = match std::fs::metadata(&path) {
             Ok(meta) => {
                 if meta.len() > self.config.max_file_size as u64 {
                     return FileOperationResult {
@@ -245,29 +245,63 @@ impl FileSystemService {
                         entries: None,
                     };
                 }
+                path.clone()
             }
-            Err(e) => {
-                return FileOperationResult {
-                    success: false,
-                    path: path.to_string(),
-                    content: None,
-                    error: Some(format!("Failed to read metadata: {}", e)),
-                    entries: None,
-                };
+            Err(_) => {
+                // File not found at exact path — search common directories
+                let file_name = std::path::Path::new(&path).file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&path);
+                let search_dirs = ["src", "docs", "client", "client/ui", "client/api", "client/contracts"];
+                let root = project_dir();
+                let mut found = None;
+                for dir in &search_dirs {
+                    let candidate = root.join(dir).join(file_name);
+                    if candidate.exists() {
+                        if let Ok(canonical) = candidate.canonicalize() {
+                            let s = canonical.to_string_lossy().to_string().to_lowercase();
+                            found = Some(strip_unc_prefix(s));
+                            break;
+                        }
+                    }
+                }
+                match found {
+                    Some(p) => {
+                        if let Err(e) = self.check_limiter(&p) {
+                            return FileOperationResult {
+                                success: false,
+                                path: p,
+                                content: None,
+                                error: Some(e),
+                                entries: None,
+                            };
+                        }
+                        p
+                    }
+                    None => {
+                        return FileOperationResult {
+                            success: false,
+                            path: path.to_string(),
+                            content: None,
+                            error: Some(format!("Failed to read metadata: The system cannot find the file specified. (os error 2)")),
+                            entries: None,
+                        };
+                    }
+                }
             }
-        }
+        };
 
-        match std::fs::read_to_string(&path) {
+        match std::fs::read_to_string(&resolved_path) {
             Ok(content) => FileOperationResult {
                 success: true,
-                path: path.clone(),
+                path: resolved_path.clone(),
                 content: Some(content),
                 error: None,
                 entries: None,
             },
             Err(e) => FileOperationResult {
                 success: false,
-                path: path.clone(),
+                path: resolved_path.clone(),
                 content: None,
                 error: Some(format!("Failed to read file: {}", e)),
                 entries: None,

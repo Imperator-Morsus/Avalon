@@ -1,6 +1,6 @@
 # Avalon Requirements
 
-This file lists the dependencies required to build and run Avalon.
+This file lists the dependencies required to build and run Avalon.:
 
 ## System Dependencies
 

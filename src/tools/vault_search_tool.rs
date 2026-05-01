@@ -35,7 +35,7 @@ impl Tool for VaultSearchTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _ctx: &ToolContext<'_>,
+        ctx: &ToolContext<'_>,
     ) -> Result<serde_json::Value, String> {
         let query = input
             .get("query")
@@ -47,7 +47,27 @@ impl Tool for VaultSearchTool {
             .and_then(|v| v.as_u64())
             .unwrap_or(10) as usize;
 
-        let results = self.vault.lock().unwrap().search(query, limit)?;
+        let results = match self.vault.lock().unwrap()
+            .search_filtered(query, limit, &ctx.permission_level) {
+            Ok(r) => r,
+            Err(e) => {
+                ctx.audit("vault_search_error", json!({
+                    "query": query,
+                    "error": &e,
+                    "actor": ctx.actor,
+                    "session_id": ctx.session_id,
+                }));
+                return Err(e);
+            }
+        };
+
+        let count = results.len();
+        ctx.audit("vault_search", json!({
+            "query": query,
+            "results_returned": count,
+            "actor": ctx.actor,
+            "session_id": ctx.session_id,
+        }));
 
         let docs: Vec<serde_json::Value> = results.iter().map(|doc| {
             json!({
@@ -57,6 +77,7 @@ impl Tool for VaultSearchTool {
                 "content_type": doc.content_type,
                 "size_bytes": doc.size_bytes,
                 "ingested_at": doc.ingested_at,
+                "access_tier": doc.access_tier,
             })
         }).collect();
 

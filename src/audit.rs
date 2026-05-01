@@ -47,6 +47,7 @@ pub struct ArchiveManifest {
     pub signed_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Clone)]
 pub struct AuditLog {
     session_id: String,
     seq: u64,
@@ -110,7 +111,7 @@ impl AuditLog {
         self.push_with_actor(entry_type, "assistant", data);
     }
 
-    fn push_with_actor(&mut self, entry_type: &str, actor: &str, data: serde_json::Value) {
+    pub(crate) fn push_with_actor(&mut self, entry_type: &str, actor: &str, data: serde_json::Value) {
         self.seq += 1;
         let timestamp = chrono::Utc::now();
 

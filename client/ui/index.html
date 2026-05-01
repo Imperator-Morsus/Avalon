@@ -22,6 +22,7 @@
     <button class="settings-btn" id="agentBtn" title="Agents">&#x1F916;</button>
     <button class="settings-btn" id="mapBtn" title="Project Map">&#x26F6;</button>
     <button class="settings-btn" id="settingsBtn" title="Settings">&#x2699;</button>
+    <button class="settings-btn" id="logoutBtn" title="Logout" style="display:none;">&#x21BA;</button>
   </div>
   <div class="window-controls">
     <button class="win-btn minimize" id="winMinBtn" title="Minimize">&#x2013;</button>
@@ -47,6 +48,7 @@
       <textarea id="userInput" rows="1" placeholder="Ask anything..." spellcheck="true" autofocus></textarea>
       <button class="fetch-btn" id="fetchBtn" title="Direct Fetch">&#x2193;</button>
       <button class="send-btn" id="sendBtn">Send</button>
+      <button class="stop-btn hidden" id="stopBtn" title="Stop">&#x25A0;</button>
     </div>
   </div>
 
@@ -106,17 +108,52 @@
       <div class="mindmap-tabs">
         <button class="mindmap-tab active" id="tabVaultDocs" data-tab="docs">Documents</button>
         <button class="mindmap-tab" id="tabVaultImages" data-tab="images">Images</button>
+        <button class="mindmap-tab" id="tabVaultGraph" data-tab="graph">Graph</button>
       </div>
       <div class="mindmap-actions">
         <button id="vaultCloseBtn">&#x2715;</button>
       </div>
     </div>
     <div class="vault-container" id="vaultContainer">
-      <div class="vault-search-bar">
+      <div class="vault-search-bar" id="vaultSearchBar">
         <input type="text" id="vaultSearchInput" placeholder="Search vault..." />
         <button id="vaultSearchBtn">Search</button>
       </div>
       <div class="vault-results" id="vaultResults"></div>
+      <div class="mindmap-container hidden" id="vaultGraphContainer" style="height: calc(100% - 50px);">
+        <div class="graph-toolbar" id="graphToolbar">
+          <button class="graph-tool-btn" id="graphZoomOut" title="Zoom out">-</button>
+          <span class="graph-zoom-label" id="graphZoomLabel">100%</span>
+          <button class="graph-tool-btn" id="graphZoomIn" title="Zoom in">+</button>
+          <div class="graph-tool-sep"></div>
+          <button class="graph-tool-btn" id="graphFit" title="Fit to view">Fit</button>
+          <button class="graph-tool-btn" id="graphReset" title="Reset view">Reset</button>
+          <div class="graph-tool-sep"></div>
+          <button class="graph-tool-btn" id="graphOutlineToggle" title="Toggle outline">Outline</button>
+          <button class="graph-tool-btn" id="graphThemeToggle" title="Switch theme">Theme</button>
+          <div class="graph-tool-sep"></div>
+          <button class="graph-tool-btn" id="graphExportSvg" title="Export SVG">SVG</button>
+          <button class="graph-tool-btn" id="graphExportPng" title="Export PNG">PNG</button>
+          <button class="graph-tool-btn" id="graphExportJson" title="Export JSON">JSON</button>
+        </div>
+        <div class="graph-layout">
+          <div class="graph-sidebar hidden" id="graphSidebar">
+            <div class="graph-sidebar-header">Outline</div>
+            <div class="graph-outline-tree" id="graphOutlineTree"></div>
+          </div>
+          <div class="graph-canvas-wrapper">
+            <svg id="vaultGraphSvg" xmlns="http://www.w3.org/2000/svg"></svg>
+            <div class="graph-tooltip hidden" id="graphTooltip"></div>
+          </div>
+          <div class="graph-detail-panel hidden" id="graphDetailPanel">
+            <div class="graph-detail-header">
+              <span class="graph-detail-title" id="graphDetailTitle">Details</span>
+              <button class="graph-detail-close" id="graphDetailClose">&#x2715;</button>
+            </div>
+            <div class="graph-detail-content" id="graphDetailContent"></div>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -151,11 +188,30 @@
 </div>
 
 <div class="status-bar" id="statusBar">
-  <span><span class="dot" id="statusDot"></span><span id="statusText">Loading models...</span></span>
+  <span><span class="dot" id="statusDot"></span><span id="statusText">Loading models...</span><button class="reconnect-btn hidden" id="reconnectBtn">Reconnect</button></span>
   <span id="iterCount"></span>
+  <button class="restart-btn" id="restartBtn" title="Restart Backend">&#x21bb;</button>
 </div>
 
   <div class="spell-menu hidden" id="spellMenu"></div>
+
+<!-- Login overlay -->
+<div id="loginOverlay" class="hidden" style="position:fixed;inset:0;background:rgba(10,10,15,0.95);display:flex;align-items:center;justify-content:center;z-index:9999;">
+  <div style="background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:40px;width:360px;max-width:90vw;text-align:center;">
+    <h2 style="color:var(--text);margin:0 0 8px;font-size:1.5rem;">Avalon Login</h2>
+    <div id="loginUserDisplay" style="color:var(--muted);font-size:0.85rem;margin-bottom:20px;"></div>
+    <div id="loginError" style="color:#ef4444;font-size:0.85rem;min-height:20px;margin-bottom:12px;"></div>
+    <div style="margin-bottom:16px;">
+      <input type="text" id="loginUsername" placeholder="Username" autocomplete="username"
+        style="width:100%;padding:10px 12px;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;box-sizing:border-box;font-size:0.95rem;" />
+    </div>
+    <div style="margin-bottom:20px;">
+      <input type="password" id="loginPassword" placeholder="Password" autocomplete="current-password"
+        style="width:100%;padding:10px 12px;background:var(--panel2);color:var(--text);border:1px solid var(--border);border-radius:8px;box-sizing:border-box;font-size:0.95rem;" />
+    </div>
+    <button id="loginSubmit" style="width:100%;padding:12px;background:#3a6a3a;color:#fff;border:none;border-radius:8px;font-size:1rem;cursor:pointer;">Sign In</button>
+  </div>
+</div>
 
 <script src="app.js"></script>
 </body>

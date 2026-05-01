@@ -163,7 +163,7 @@ impl Tool for FetchUrlTool {
             let result = extract_pdf_text(&bytes, url)?;
             // Auto-ingest PDF text into vault
             if let Ok(content) = result.get("content").and_then(|v| v.as_str()).ok_or("") {
-                let _ = ctx.vault.lock().unwrap().ingest_text(url, None, content, "pdf");
+                let _ = ctx.vault.lock().unwrap().ingest_text(url, None, content, "pdf", "Public", None);
             }
             return Ok(result);
         }
@@ -179,7 +179,7 @@ impl Tool for FetchUrlTool {
 
         // Auto-ingest fetched text into vault
         let content_type_label = if content_type.contains("html") { "html" } else { "text" };
-        let _ = ctx.vault.lock().unwrap().ingest_text(url, None, &text, content_type_label);
+        let _ = ctx.vault.lock().unwrap().ingest_text(url, None, &text, content_type_label, "Public", None);
 
         Ok(serde_json::json!({
             "url": url,

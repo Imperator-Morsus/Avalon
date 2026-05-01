@@ -29,12 +29,32 @@ pub struct MindMap {
     pub root: String,
 }
 
+impl MindMap {
+    /// Return a truncated copy with at most `max_nodes` nodes and only edges between kept nodes.
+    pub fn truncated(&self, max_nodes: usize) -> MindMap {
+        let mut nodes = self.nodes.clone();
+        nodes.truncate(max_nodes);
+        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
+        let edges: Vec<MindMapEdge> = self.edges
+            .iter()
+            .filter(|e| kept.contains(&e.source) && kept.contains(&e.target))
+            .cloned()
+            .collect();
+        MindMap {
+            nodes,
+            edges,
+            root: self.root.clone(),
+        }
+    }
+}
+
 // ═════════════════════════════════════════════════════════════════════════════
 // Mind Map Service
 // ═════════════════════════════════════════════════════════════════════════════
 
 pub struct MindMapService {
     graph: MindMap,
+    cached_graph: Option<MindMap>,
     remote_graph: Option<MindMap>,
 }
 
@@ -46,12 +66,22 @@ impl MindMapService {
                 edges: Vec::new(),
                 root: String::new(),
             },
+            cached_graph: None,
             remote_graph: None,
         }
     }
 
     pub fn graph(&self) -> &MindMap {
         &self.graph
+    }
+
+    pub fn cached(&self) -> Option<&MindMap> {
+        self.cached_graph.as_ref()
+    }
+
+    pub fn build_and_cache(&mut self, allowed_paths: &[String], max_depth: usize) {
+        self.build(allowed_paths, max_depth);
+        self.cached_graph = Some(self.graph.clone());
     }
 
     pub fn remote_graph(&self) -> Option<&MindMap> {
@@ -125,11 +155,19 @@ impl MindMapService {
                         let entry_str = entry_path.to_string_lossy().to_string();
 
                         if entry_path.is_dir() {
+                            self.add_node(&entry_str, node_name(&entry_path), "dir");
                             if depth < max_depth {
                                 queue.push((entry_str.clone(), depth + 1));
                             }
                             self.add_edge(&path_str, &entry_str, "contains");
                         } else if is_source_file(&entry_path) || is_image_file(&entry_path) {
+                            if is_image_file(&entry_path) {
+                                let mut meta = HashMap::new();
+                                meta.insert("image_path".to_string(), entry_str.clone());
+                                self.add_node_with_metadata(&entry_str, node_name(&entry_path), "image", meta);
+                            } else {
+                                self.add_node(&entry_str, node_name(&entry_path), "file");
+                            }
                             if depth < max_depth {
                                 queue.push((entry_str.clone(), depth + 1));
                             }
@@ -204,8 +242,82 @@ impl MindMapService {
             }
         }
 
-        if !self.graph.nodes.is_empty() {
-            self.graph.root = self.graph.nodes[0].id.clone();
+        if prefix.is_none() {
+            if let Some(first) = allowed_paths.first() {
+                let root = std::fs::canonicalize(first)
+                    .unwrap_or_else(|_| Path::new(first).to_path_buf())
+                    .to_string_lossy()
+                    .to_string();
+                self.graph.root = root;
+            }
+        }
+    }
+
+    /// Build the mindmap from The Vault items instead of filesystem.
+    pub fn build_from_vault(
+        &mut self,
+        items: &[crate::db::VaultItem],
+        relationships: &[crate::db::VaultRelationship],
+    ) {
+        self.graph.nodes.clear();
+        self.graph.edges.clear();
+
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        // Root node
+        self.add_node("vault:root", "The Vault".to_string(), "root");
+        seen.insert("vault:root".to_string());
+        self.graph.root = "vault:root".to_string();
+
+        for item in items {
+            let path = std::path::Path::new(&item.source_path);
+            let mut current = "vault:root".to_string();
+
+            // Build directory nodes from path ancestors
+            if let Some(parent) = path.parent() {
+                for component in parent.components() {
+                    let comp_str = component.as_os_str().to_string_lossy().to_string();
+                    let node_id = format!("dir:{}", comp_str);
+                    if seen.insert(node_id.clone()) {
+                        self.add_node(&node_id, comp_str.clone(), "dir");
+                    }
+                    self.add_edge(&current, &node_id, "contains");
+                    current = node_id;
+                }
+            }
+
+            // Add item node
+            let node_type = if item.content_type == "image" { "image" } else { "file" };
+            let label = item.title.clone().unwrap_or_else(|| {
+                path.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| format!("item_{}", item.id))
+            });
+
+            let mut meta = std::collections::HashMap::new();
+            meta.insert("item_id".to_string(), item.id.to_string());
+            meta.insert("content_type".to_string(), item.content_type.clone());
+            if item.has_contradictions {
+                meta.insert("warning".to_string(), "contradiction".to_string());
+            }
+
+            self.add_node_with_metadata(
+                &item.source_path, label, node_type, meta
+            );
+            self.add_edge(&current, &item.source_path, "contains");
+        }
+
+        // Add relationship edges
+        for rel in relationships {
+            let source_id = items.iter().find(|i| i.id == rel.source_id)
+                .map(|i| i.source_path.clone())
+                .unwrap_or_else(|| format!("item_{}", rel.source_id));
+            let target_id = items.iter().find(|i| i.id == rel.target_id)
+                .map(|i| i.source_path.clone())
+                .unwrap_or_else(|| format!("item_{}", rel.target_id));
+            self.add_edge(
+                &source_id, &target_id, &rel.relation_type
+            );
         }
     }
 
@@ -228,28 +340,15 @@ impl MindMapService {
         self.graph.root = root.to_string();
     }
 
-    /// Return a truncated copy with at most `max_nodes` nodes and only edges between kept nodes.
     pub fn truncated(&self, max_nodes: usize) -> MindMap {
-        let mut nodes = self.graph.nodes.clone();
-        nodes.truncate(max_nodes);
-        let kept: HashSet<String> = nodes.iter().map(|n| n.id.clone()).collect();
-        let edges: Vec<MindMapEdge> = self.graph.edges
-            .iter()
-            .filter(|e| kept.contains(&e.source) && kept.contains(&e.target))
-            .cloned()
-            .collect();
-        MindMap {
-            nodes,
-            edges,
-            root: self.graph.root.clone(),
-        }
+        self.graph.truncated(max_nodes)
     }
 
-    fn add_node(&mut self, id: &str, label: String, node_type: &str) {
+    pub fn add_node(&mut self, id: &str, label: String, node_type: &str) {
         self.add_node_with_metadata(id, label, node_type, HashMap::new());
     }
 
-    fn add_node_with_metadata(&mut self,
+    pub fn add_node_with_metadata(&mut self,
         id: &str,
         label: String,
         node_type: &str,
@@ -276,7 +375,7 @@ impl MindMapService {
         }
     }
 
-    fn add_edge(&mut self, source: &str, target: &str, relation: &str) {
+    pub fn add_edge(&mut self, source: &str, target: &str, relation: &str) {
         if self.graph.edges.iter().any(|e| e.source == source && e.target == target && e.relation == relation) {
             return;
         }

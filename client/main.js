@@ -1,6 +1,6 @@
 const { app, BrowserWindow, Menu, ipcMain } = require('electron');
 const path = require('path');
-const { spawn, exec } = require('child_process');
+const { spawn, execSync } = require('child_process');
 
 let backendProcess = null;
 
@@ -44,22 +44,38 @@ function startBackend() {
 }
 
 function stopBackend() {
-  if (!backendProcess) return;
-  const pid = backendProcess.pid;
-  backendProcess = null;
-
-  if (process.platform === 'win32') {
-    exec(`taskkill /PID ${pid} /T /F`, (err) => {
-      if (err) console.error('Error killing backend:', err.message);
-      else console.log('Backend stopped.');
-    });
-  } else {
-    try {
-      process.kill(pid, 'SIGTERM');
-    } catch (e) {
-      console.error('Error killing backend:', e.message);
+  return new Promise((resolve) => {
+    if (!backendProcess) {
+      resolve();
+      return;
     }
-  }
+    const pid = backendProcess.pid;
+
+    backendProcess.on('exit', () => {
+      backendProcess = null;
+      resolve();
+    });
+
+    if (process.platform === 'win32') {
+      try {
+        execSync(`taskkill /PID ${pid} /T /F`, { stdio: 'ignore' });
+      } catch (e) {
+        // Process may already be dead
+      }
+    } else {
+      try {
+        process.kill(pid, 'SIGTERM');
+      } catch (e) {
+        // Process may already be dead
+      }
+    }
+
+    // Timeout fallback
+    setTimeout(() => {
+      backendProcess = null;
+      resolve();
+    }, 3000);
+  });
 }
 
 let mainWindow = null;
@@ -90,8 +106,13 @@ const createWindow = () => {
   }
 
   win.on('closed', () => {
-    stopBackend();
     mainWindow = null;
+  });
+
+  win.on('close', async (e) => {
+    e.preventDefault();
+    await stopBackend();
+    if (mainWindow) mainWindow.destroy();
   });
 };
 
@@ -105,17 +126,23 @@ app.whenReady().then(() => {
   });
 });
 
-app.on('window-all-closed', () => {
-  stopBackend();
+app.on('window-all-closed', async () => {
+  await stopBackend();
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
-  stopBackend();
+app.on('will-quit', async () => {
+  await stopBackend();
 });
 
-app.on('will-quit', () => {
-  stopBackend();
+// Backend restart IPC
+ipcMain.on('restart-backend', async () => {
+  console.log('[Avalon] Restarting backend...');
+  await stopBackend();
+  setTimeout(() => {
+    startBackend();
+    console.log('[Avalon] Backend restarted.');
+  }, 1500);
 });
 
 // Window control IPC
@@ -136,4 +163,47 @@ ipcMain.on('window-maximize', () => {
 ipcMain.on('window-close', () => {
   stopBackend();
   if (mainWindow) mainWindow.close();
+});
+
+// Auth IPC handlers — relay auth operations from renderer to backend
+const API_BASE = 'http://127.0.0.1:8080';
+
+ipcMain.handle('auth-login', async (event, username, password) => {
+  try {
+    const resp = await fetch(`${API_BASE}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    return await resp.json();
+  } catch(e) {
+    return { ok: false, error: 'Connection failed: ' + e.message };
+  }
+});
+
+ipcMain.handle('auth-logout', async () => {
+  try {
+    const { sessionStorage } = require('electron').session || {};
+    // Get token from sessionStorage — main process can't access renderer sessionStorage directly
+    // So we rely on the renderer to call logout with the token in header
+    // This just returns ok — actual logout happens via fetch from renderer
+    return { ok: true };
+  } catch(e) {
+    return { ok: false, error: e.message };
+  }
+});
+
+ipcMain.handle('auth-me', async () => {
+  try {
+    const resp = await fetch(`${API_BASE}/api/auth/me`);
+    return resp.ok ? await resp.json() : { ok: false, error: 'not authenticated' };
+  } catch(e) {
+    return { ok: false, error: 'Connection failed: ' + e.message };
+  }
+});
+
+ipcMain.handle('auth-get-token', async () => {
+  // Token lives in renderer sessionStorage — main process can't access it directly
+  // Return null — renderer uses its own sessionStorage access
+  return null;
 });
